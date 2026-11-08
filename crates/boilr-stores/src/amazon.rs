@@ -94,6 +94,7 @@ pub fn begin_login() -> PendingLogin {
                 "https://www.amazon.com/?openid.assoc_handle=...&openid.oa2.authorization_code=..."
                     .to_string(),
         },
+        user_agent: Some("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) @amzn/aga-electron-platform/1.0.0 Chrome/78.0.3904.130 Electron/7.1.9 Safari/537.36".to_string()),
         state: serde_json::to_value(&state).unwrap_or_default(),
     }
 }

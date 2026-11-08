@@ -2,7 +2,7 @@
 // clicked through in a normal browser (`npm run dev`). Never loaded inside Tauri.
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
-import type { PlatformSummary, ShortcutSummary, SyncPlan } from "./types";
+import type { PlatformSummary, ShortcutSummary, StoreAccount, SyncPlan } from "./types";
 import type { Settings } from "./settings";
 import type { ArtworkGame, ArtworkKind, ArtworkOption } from "./types";
 
@@ -17,7 +17,10 @@ const game = (name: string, exe = `/games/${name}`): ShortcutSummary => ({
   needs_proton: false,
   needs_symlinks: false,
   blacklisted: false,
+  installed: true,
 });
+
+const owned = (name: string): ShortcutSummary => ({ ...game(name, "xdg-open"), installed: false });
 
 let settings: Settings = {
   steam: { stop_steam: false, start_steam: false, create_collections: false, optimize_for_big_picture: false, location: null },
@@ -35,7 +38,48 @@ let platforms: PlatformSummary[] = [
   { code_name: "legendary", name: "Legendary", enabled: true, error: "No such file or directory (os error 2)", games: [] },
   { code_name: "flatpak", name: "Flatpak", enabled: true, error: null, games: ["Ludusavi", "Modrinth App", "OrcaSlicer", "Snapmaker_Orca", "Vinegar"].map((n) => game(n, "flatpak")) },
   { code_name: "minigalaxy", name: "MiniGalaxy", enabled: false, error: null, games: [] },
+  { code_name: "gog_account", name: "GOG account", enabled: true, error: null, games: ["Unreal Gold", "The Witcher 3: Wild Hunt", "Stardew Valley"].map(owned) },
+  { code_name: "epic_account", name: "Epic Games account", enabled: false, error: null, games: [] },
 ];
+
+const account = (key: string, name: string, extra: Partial<StoreAccount> = {}): StoreAccount => ({
+  store: key,
+  key,
+  name,
+  signed_in: false,
+  account_name: null,
+  game_count: null,
+  fetched_at: null,
+  manual: {
+    kind: "paste",
+    url: `https://example.com/${key}/login`,
+    instructions: "then paste the address your browser ends on.",
+    placeholder: "https://…",
+  },
+  webview_login: true,
+  code_name: `${key}_account`,
+  enabled: false,
+  install_with: "auto",
+  ...extra,
+});
+
+let accounts: StoreAccount[] = [
+  account("epic", "Epic Games Store"),
+  account("gog", "GOG", { signed_in: true, account_name: "player1", game_count: 3, fetched_at: Math.floor(Date.now() / 1000) - 3600, enabled: true }),
+  account("amazon", "Amazon Games"),
+  account("ea", "EA app", { manual: { kind: "unsupported" } }),
+  account("battlenet", "Battle.net", { manual: { kind: "unsupported" } }),
+  account("humble", "Humble Bundle"),
+  account("itch", "itch.io", {
+    webview_login: false,
+    manual: { kind: "paste", url: "https://itch.io/user/settings/api-keys", instructions: "create an API key and paste it here.", placeholder: "API key" },
+  }),
+];
+
+const updateAccount = (key: string, change: Partial<StoreAccount>): StoreAccount | undefined => {
+  accounts = accounts.map((a) => (a.key === key ? { ...a, ...change } : a));
+  return accounts.find((a) => a.key === key);
+};
 
 const importedIds = new Set<number>();
 const plan = (): SyncPlan => ({
@@ -44,7 +88,7 @@ const plan = (): SyncPlan => ({
     .flatMap((p) =>
       p.games
         .filter((g) => !(settings.blacklisted_games ?? []).includes(g.app_id) && !importedIds.has(g.app_id))
-        .map((g) => ({ platform: p.name, platform_code: p.code_name, needs_proton: false, needs_symlinks: false, shortcut: g }))
+        .map((g) => ({ platform: p.name, platform_code: p.code_name, needs_proton: false, needs_symlinks: false, installed: g.installed, shortcut: g }))
     ),
   removals: importedIds.size ? [] : [
     {
@@ -178,6 +222,29 @@ mockIPC(
     switch (cmd) {
       case "load_settings":
         return settings;
+      case "list_store_accounts":
+        return accounts;
+      case "update_store_account":
+        return updateAccount(a.store, {
+          ...(a.enabled === undefined ? {} : { enabled: a.enabled }),
+          ...(a.installWith === undefined ? {} : { install_with: a.installWith }),
+        });
+      case "refresh_store_library":
+        await delay(800);
+        return updateAccount(a.store, { fetched_at: Math.floor(Date.now() / 1000) });
+      case "sign_out_store":
+        return updateAccount(a.store, { signed_in: false, account_name: null, game_count: null, fetched_at: null });
+      case "submit_store_login":
+        await delay(800);
+        return updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 12, fetched_at: Math.floor(Date.now() / 1000), enabled: true });
+      case "open_store_sign_in_page":
+        return null;
+      case "start_store_login":
+        setTimeout(() => {
+          updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 42, fetched_at: Math.floor(Date.now() / 1000), enabled: true });
+          void emit("store-login", { store: a.store, ok: true, message: "Signed in as player1" });
+        }, 1500);
+        return null;
       case "update_settings":
         settings = {
           ...settings,

@@ -64,10 +64,7 @@ pub async fn send(request: RequestBuilder) -> eyre::Result<Response> {
             snippet(&body)
         ));
     }
-    Err(eyre::format_err!(
-        "{status} from {url}: {}",
-        snippet(&body)
-    ))
+    Err(eyre::format_err!("{status} from {url}: {}", snippet(&body)))
 }
 
 pub fn snippet(text: &str) -> String {

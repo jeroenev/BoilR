@@ -29,11 +29,21 @@ import { Sources } from "./components/Sources";
 import { SettingsView } from "./components/SettingsView";
 import { ShortcutsView } from "./components/ShortcutsView";
 import { ArtworkView } from "./components/ArtworkView";
+import { AccountsView } from "./components/AccountsView";
 import { useNavigation } from "./lib/navigation";
 
-const VIEWS = ["games", "artwork", "shortcuts", "settings"] as const;
+const VIEWS = ["games", "accounts", "artwork", "shortcuts", "settings"] as const;
 type View = (typeof VIEWS)[number];
-const VIEW_LABELS: Record<View, string> = { games: "Games", artwork: "Artwork", shortcuts: "Shortcuts", settings: "Settings" };
+const VIEW_LABELS: Record<View, string> = {
+  games: "Games",
+  accounts: "Accounts",
+  artwork: "Artwork",
+  shortcuts: "Shortcuts",
+  settings: "Settings",
+};
+
+/** Store accounts have their own view; their settings stay out of the launcher list. */
+const isAccountSource = (codeName: string) => codeName.endsWith("_account");
 
 const applySettingsPatch = (current: Settings | null, patch: SettingsUpdatePayload): Settings | null => {
   if (!current) return current;
@@ -108,7 +118,7 @@ const App = () => {
     setPlatformLoading(true);
     try {
       const payload = await invoke<PlatformSettingsPayload[]>("list_platform_settings");
-      setPlatformGroups(payload.map(buildPlatformSettingsGroup));
+      setPlatformGroups(payload.filter((p) => !isAccountSource(p.code_name)).map(buildPlatformSettingsGroup));
     } catch (err) {
       setPlatformError(errorMessage(err));
     } finally {
@@ -139,6 +149,11 @@ const App = () => {
       setRescanning(false);
     }
   }, [fetchAll, fetchPlatformSettings, view]);
+
+  // Signing in, out or refreshing a library changes the game list and the import plan.
+  const refreshAfterAccountChange = useCallback(() => {
+    void fetchAll().catch((err) => setLoadError(errorMessage(err)));
+  }, [fetchAll]);
 
   const updateSettings = useCallback(
     async (patch: SettingsUpdatePayload) => {
@@ -216,6 +231,10 @@ const App = () => {
   );
 
   const openPlatformSettings = useCallback((codeName: string) => {
+    if (isAccountSource(codeName)) {
+      setView("accounts");
+      return;
+    }
     setFocusPlatform(codeName);
     setView("settings");
   }, []);
@@ -340,6 +359,8 @@ const App = () => {
               />
             </div>
           </div>
+        ) : view === "accounts" ? (
+          <AccountsView onAccountsChanged={refreshAfterAccountChange} />
         ) : view === "artwork" ? (
           <ArtworkView settings={settings} onSettingsChanged={setSettings} />
         ) : view === "shortcuts" ? (

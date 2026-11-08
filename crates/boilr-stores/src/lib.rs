@@ -172,6 +172,10 @@ pub struct PendingLogin {
     /// URLs whose cookies the window collects when the login is done.
     pub cookie_urls: Vec<String>,
     pub manual: ManualLogin,
+    /// The user agent the login window should use, when the store's sign-in page needs a
+    /// launcher's own (Epic's captcha only passes for the Epic Games Launcher's).
+    #[serde(default)]
+    pub user_agent: Option<String>,
     /// Store-private state carried from [`begin_login`] to [`complete_login`] (PKCE
     /// verifiers, device serials).
     #[serde(default)]

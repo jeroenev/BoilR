@@ -118,6 +118,7 @@ pub fn begin_login() -> PendingLogin {
             placeholder: "https://embed.gog.com/on_login_success?origin=client&code=..."
                 .to_string(),
         },
+        user_agent: None,
         state: serde_json::Value::Null,
     }
 }

@@ -8,6 +8,8 @@ export type ShortcutSummary = {
   needs_proton: boolean;
   needs_symlinks: boolean;
   blacklisted: boolean;
+  /** False for games a store account owns that are not installed. */
+  installed: boolean;
 };
 
 export type PlatformSummary = {
@@ -43,6 +45,7 @@ export type AdditionPlan = {
   platform_code: string;
   needs_proton: boolean;
   needs_symlinks: boolean;
+  installed: boolean;
   shortcut: PlannedShortcut;
 };
 
@@ -162,4 +165,35 @@ export type GameCandidate = {
 export type GameMatch = {
   current_id: number | null;
   candidates: GameCandidate[];
+};
+
+export type ManualLogin =
+  | { kind: "unsupported" }
+  | { kind: "paste"; url: string; instructions: string; placeholder: string };
+
+export type InstallWith = "auto" | "heroic" | "browser";
+
+/** A store BoilR signs in to itself (`boilr-stores`), listing every game the account owns. */
+export type StoreAccount = {
+  store: string;
+  key: string;
+  name: string;
+  signed_in: boolean;
+  account_name: string | null;
+  game_count: number | null;
+  /** Unix seconds. */
+  fetched_at: number | null;
+  manual: ManualLogin;
+  /** Whether a login window can sign in to this store. */
+  webview_login: boolean;
+  /** The platform code name of the account, as in the game sources. */
+  code_name: string;
+  enabled: boolean;
+  install_with: InstallWith;
+};
+
+export type StoreLoginEvent = {
+  store: string;
+  ok: boolean;
+  message: string;
 };

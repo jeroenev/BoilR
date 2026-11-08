@@ -135,7 +135,9 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(session_file(StoreId::Gog))?.permissions().mode();
+            let mode = fs::metadata(session_file(StoreId::Gog))?
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
 

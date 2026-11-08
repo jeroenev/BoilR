@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod artwork;
 mod library;
 
@@ -10,7 +11,10 @@ use std::{
 
 use boilr::{
     backups::backup_shortcuts,
-    platforms::{get_platform_shortcuts, get_platforms, GamesPlatform, ShortcutToImport},
+    platforms::{
+        accounts::{drop_owned_duplicates, not_installed_collection},
+        get_platform_shortcuts, get_platforms, GamesPlatform, ShortcutToImport,
+    },
     renames::{load_rename_map, set_rename},
 };
 use boilr_core::{
@@ -67,6 +71,7 @@ fn discover_games() -> Result<Vec<PlatformSummary>, String> {
                     shortcut,
                     needs_proton,
                     needs_symlinks,
+                    installed,
                 } = shortcut;
                 let app_id = shortcut.app_id;
                 let display_name = rename_map
@@ -84,6 +89,7 @@ fn discover_games() -> Result<Vec<PlatformSummary>, String> {
                     needs_proton,
                     needs_symlinks,
                     blacklisted,
+                    installed,
                 });
             }
         }
@@ -291,6 +297,13 @@ fn main() {
             artwork::artwork_game_match,
             artwork::set_artwork_game,
             artwork::find_missing_artwork,
+            accounts::list_store_accounts,
+            accounts::update_store_account,
+            accounts::refresh_store_library,
+            accounts::sign_out_store,
+            accounts::submit_store_login,
+            accounts::start_store_login,
+            accounts::open_store_sign_in_page,
             rename_game,
             ping
         ])
@@ -364,11 +377,16 @@ fn perform_full_sync(
     #[cfg(target_family = "unix")]
     prepare_proton(&platform_shortcuts);
 
+    let extra_collections: Vec<(String, Vec<u32>)> =
+        not_installed_collection(platform_shortcuts.iter().map(|(_, list)| list))
+            .into_iter()
+            .collect();
     let import_games = to_shortcut_owned(platform_shortcuts);
     let mut progress_for_sync = progress.clone();
-    let users = sync::sync_shortcuts(
+    let users = sync::sync_shortcuts_with_collections(
         &settings,
         &import_games,
+        &extra_collections,
         &mut progress_for_sync,
         &rename_map,
     )
@@ -444,6 +462,12 @@ fn gather_platform_snapshots() -> Vec<PlatformSnapshot> {
         }
     }
 
+    // An owned game that is installed shows up once, as the installed game.
+    drop_owned_duplicates(
+        snapshots
+            .iter_mut()
+            .filter_map(|snapshot| snapshot.shortcuts.as_mut()),
+    );
     snapshots
 }
 
@@ -529,6 +553,7 @@ fn prepare_additions(
                 platform_code: snapshot.code_name.clone(),
                 needs_proton: entry.needs_proton,
                 needs_symlinks: entry.needs_symlinks,
+                installed: entry.installed,
                 shortcut: PlannedShortcut {
                     app_id: shortcut.app_id,
                     app_name,
@@ -830,6 +855,8 @@ struct ShortcutSummary {
     needs_proton: bool,
     needs_symlinks: bool,
     blacklisted: bool,
+    /// False for games a store account owns that are not installed.
+    installed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -844,6 +871,7 @@ struct AdditionPlan {
     platform_code: String,
     needs_proton: bool,
     needs_symlinks: bool,
+    installed: bool,
     shortcut: PlannedShortcut,
 }
 

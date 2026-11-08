@@ -57,6 +57,7 @@ pub fn begin_login() -> PendingLogin {
                 .to_string(),
             placeholder: "itch.io API key".to_string(),
         },
+        user_agent: None,
         state: serde_json::Value::Null,
     }
 }

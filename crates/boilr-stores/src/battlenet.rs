@@ -11,6 +11,7 @@ pub fn begin_login() -> PendingLogin {
         done_url_prefixes: vec![],
         cookie_urls: vec![],
         manual: ManualLogin::Unsupported,
+        user_agent: None,
         state: serde_json::Value::Null,
     }
 }

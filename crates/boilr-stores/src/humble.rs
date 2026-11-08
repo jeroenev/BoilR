@@ -61,6 +61,7 @@ pub fn begin_login() -> PendingLogin {
             ),
             placeholder: format!("{SESSION_COOKIE} cookie value"),
         },
+        user_agent: None,
         state: serde_json::Value::Null,
     }
 }

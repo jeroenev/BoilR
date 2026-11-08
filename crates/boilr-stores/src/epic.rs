@@ -91,6 +91,7 @@ pub fn begin_login() -> PendingLogin {
                 .to_string(),
             placeholder: "authorizationCode".to_string(),
         },
+        user_agent: Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher".to_string()),
         state: serde_json::Value::Null,
     }
 }

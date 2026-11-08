@@ -1,0 +1,535 @@
+//! What a shortcut for an owned, not installed game runs: the store's own launcher with its
+//! install link when that launcher is installed, otherwise the store page in the browser.
+//! On Linux, where most stores have no launcher, Heroic is used for Epic, GOG and Amazon
+//! games when it happens to be installed (never required).
+
+use std::path::{Path, PathBuf};
+
+use boilr_stores::{OwnedGame, StoreId};
+use steam_shortcuts_util::{shortcut::ShortcutOwned, Shortcut};
+
+use super::InstallWith;
+
+/// Launchers found on this machine.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Launchers {
+    pub epic: Option<PathBuf>,
+    pub galaxy: Option<PathBuf>,
+    pub amazon: Option<PathBuf>,
+    pub ea: Option<PathBuf>,
+    pub battlenet: Option<PathBuf>,
+    pub itch: Option<PathBuf>,
+    pub heroic: Option<Heroic>,
+    /// Stores Heroic is signed in to; Heroic can only install games of those.
+    pub heroic_stores: Vec<StoreId>,
+    /// `explorer.exe` on Windows, used to open store links.
+    pub opener: Opener,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Heroic {
+    Flatpak,
+    Native(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Opener {
+    /// `explorer.exe <link>`.
+    Explorer(PathBuf),
+    /// `xdg-open <link>`.
+    XdgOpen,
+}
+
+impl Default for Opener {
+    fn default() -> Self {
+        if cfg!(windows) {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+            Opener::Explorer(Path::new(&root).join("explorer.exe"))
+        } else {
+            Opener::XdgOpen
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Target {
+    pub exe: String,
+    pub start_dir: String,
+    pub launch_options: String,
+}
+
+impl Launchers {
+    pub fn detect() -> Self {
+        Launchers {
+            epic: detect_epic(),
+            galaxy: detect_galaxy(),
+            amazon: detect_amazon(),
+            ea: detect_ea(),
+            battlenet: detect_battlenet(),
+            itch: detect_itch(),
+            heroic: detect_heroic(),
+            heroic_stores: detect_heroic_stores(),
+            opener: Opener::default(),
+        }
+    }
+}
+
+pub(crate) fn owned_shortcut(
+    game: &OwnedGame,
+    install_with: InstallWith,
+    launchers: &Launchers,
+) -> ShortcutOwned {
+    let target = target(game, install_with, launchers);
+    let mut shortcut = Shortcut::new(
+        "0",
+        game.title.as_str(),
+        &target.exe,
+        &target.start_dir,
+        "",
+        "",
+        &target.launch_options,
+    )
+    .to_owned();
+    shortcut.dev_kit_game_id = crate::sync::shortcut_identity(game.store.key(), &game.id);
+    shortcut.tags.push(game.store.display_name().to_owned());
+    shortcut.tags.push("Not installed".to_owned());
+    shortcut
+}
+
+pub(crate) fn target(game: &OwnedGame, install_with: InstallWith, launchers: &Launchers) -> Target {
+    match install_with {
+        InstallWith::Browser => browser(launchers, &store_page(game)),
+        InstallWith::Heroic => heroic_target(game, launchers)
+            .or_else(|| launcher_target(game, launchers))
+            .unwrap_or_else(|| browser(launchers, &store_page(game))),
+        InstallWith::Auto => launcher_target(game, launchers)
+            .or_else(|| heroic_target(game, launchers))
+            .unwrap_or_else(|| browser(launchers, &store_page(game))),
+    }
+}
+
+/// The store's own launcher, opened on the game's install page or dialog.
+fn launcher_target(game: &OwnedGame, launchers: &Launchers) -> Option<Target> {
+    match game.store {
+        StoreId::Epic => {
+            let launcher = launchers.epic.as_ref()?;
+            Some(Target {
+                exe: quoted(launcher),
+                start_dir: parent_dir(launcher),
+                launch_options: epic_install_link(game),
+            })
+        }
+        StoreId::Gog => {
+            launchers.galaxy.as_ref()?;
+            Some(open_link(
+                launchers,
+                &format!("goggalaxy://openGameView/{}", game.id),
+            ))
+        }
+        StoreId::Amazon => {
+            launchers.amazon.as_ref()?;
+            Some(open_link(
+                launchers,
+                &format!("amazon-games://install/{}", game.id),
+            ))
+        }
+        StoreId::Ea => {
+            let launcher = launchers.ea.as_ref()?;
+            Some(open_link(launchers, &ea_install_link(game, launcher)))
+        }
+        StoreId::BattleNet => {
+            let launcher = launchers.battlenet.as_ref()?;
+            Some(Target {
+                exe: quoted(launcher),
+                start_dir: parent_dir(launcher),
+                launch_options: format!("--game={}", game.id),
+            })
+        }
+        StoreId::Itch => {
+            launchers.itch.as_ref()?;
+            Some(open_link(
+                launchers,
+                &format!("itch://install?game_id={}&launch", game.id),
+            ))
+        }
+        StoreId::Humble => None,
+    }
+}
+
+/// Playnite's launch link (EpicLibrary `EpicLauncher.cs`), the one BoilR writes for
+/// installed games too. Playnite avoids `?action=install`: Epic shows an old, buggy install
+/// dialog for it. Without catalog ids, the library page is the safe fallback.
+fn epic_install_link(game: &OwnedGame) -> String {
+    match (game.extra("namespace"), game.extra("catalog_item_id")) {
+        (Some(namespace), Some(catalog_item_id)) => format!(
+            "com.epicgames.launcher://apps/{namespace}%3A{catalog_item_id}%3A{}?action=launch&silent=true",
+            game.id
+        ),
+        _ => "com.epicgames.launcher://store/library".to_string(),
+    }
+}
+
+fn ea_install_link(game: &OwnedGame, launcher: &Path) -> String {
+    let ea_app = launcher
+        .file_name()
+        .map(|name| {
+            name.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("eadesktop")
+        })
+        .unwrap_or(true);
+    if ea_app {
+        format!("link2ea://launchgame/{}", game.id)
+    } else {
+        format!("origin2://game/launch?offerIds={}&autoDownload=1", game.id)
+    }
+}
+
+/// Heroic handles Epic (Legendary), GOG and Amazon (Nile) games; `heroic://launch` asks to
+/// install a game that is not installed.
+fn heroic_target(game: &OwnedGame, launchers: &Launchers) -> Option<Target> {
+    let runner = match game.store {
+        StoreId::Epic => "legendary",
+        StoreId::Gog => "gog",
+        StoreId::Amazon => "nile",
+        _ => return None,
+    };
+    if !launchers.heroic_stores.contains(&game.store) {
+        return None;
+    }
+    let link = format!("heroic://launch/{runner}/{}", game.id);
+    match launchers.heroic.as_ref()? {
+        Heroic::Flatpak => Some(Target {
+            exe: "flatpak".to_string(),
+            start_dir: String::new(),
+            launch_options: format!("run com.heroicgameslauncher.hgl {link} --no-gui --no-sandbox"),
+        }),
+        Heroic::Native(path) => Some(Target {
+            exe: quoted(path),
+            start_dir: String::new(),
+            launch_options: link,
+        }),
+    }
+}
+
+fn browser(launchers: &Launchers, url: &str) -> Target {
+    open_link(launchers, url)
+}
+
+fn open_link(launchers: &Launchers, link: &str) -> Target {
+    match &launchers.opener {
+        Opener::Explorer(explorer) => Target {
+            exe: quoted(explorer),
+            start_dir: String::new(),
+            launch_options: format!("\"{link}\""),
+        },
+        Opener::XdgOpen => Target {
+            exe: "xdg-open".to_string(),
+            start_dir: String::new(),
+            launch_options: format!("\"{link}\""),
+        },
+    }
+}
+
+/// A page where the user can get the game: the store module's `url` when it has one.
+pub(crate) fn store_page(game: &OwnedGame) -> String {
+    if let Some(url) = game.extra("url").filter(|url| url.starts_with("https://")) {
+        return url.to_string();
+    }
+    let slug = game.extra("slug").filter(|slug| !slug.is_empty());
+    match game.store {
+        StoreId::Epic => match game.extra("product_slug").or(slug) {
+            Some(slug) => format!("https://store.epicgames.com/p/{slug}"),
+            None => format!(
+                "https://store.epicgames.com/browse?q={}",
+                url::form_urlencoded::byte_serialize(game.title.as_bytes()).collect::<String>()
+            ),
+        },
+        StoreId::Gog => match slug {
+            Some(slug) => format!("https://www.gog.com/game/{slug}"),
+            None => "https://www.gog.com/account".to_string(),
+        },
+        StoreId::Amazon => "https://gaming.amazon.com/home".to_string(),
+        StoreId::Ea => "https://www.ea.com/ea-app".to_string(),
+        StoreId::BattleNet => "https://download.battle.net/".to_string(),
+        StoreId::Humble => "https://www.humblebundle.com/home/library".to_string(),
+        StoreId::Itch => format!("https://itch.io/game/{}", game.id),
+    }
+}
+
+fn quoted(path: &Path) -> String {
+    format!("\"{}\"", path.to_string_lossy())
+}
+
+fn parent_dir(path: &Path) -> String {
+    path.parent().map(quoted).unwrap_or_default()
+}
+
+fn first_existing(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    paths.into_iter().find(|path| path.is_file())
+}
+
+fn env_path(var: &str, rest: &[&str]) -> Option<PathBuf> {
+    let base = std::env::var_os(var)?;
+    let mut path = PathBuf::from(base);
+    for part in rest {
+        path.push(part);
+    }
+    Some(path)
+}
+
+fn detect_epic() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let mut candidates = vec![];
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        for arch in ["Win64", "Win32"] {
+            candidates.extend(env_path(
+                var,
+                &[
+                    "Epic Games",
+                    "Launcher",
+                    "Portal",
+                    "Binaries",
+                    arch,
+                    "EpicGamesLauncher.exe",
+                ],
+            ));
+        }
+    }
+    first_existing(candidates)
+}
+
+fn detect_galaxy() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    first_existing(
+        ["ProgramFiles(x86)", "ProgramFiles"]
+            .into_iter()
+            .filter_map(|var| env_path(var, &["GOG Galaxy", "GalaxyClient.exe"])),
+    )
+}
+
+fn detect_amazon() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    first_existing(env_path(
+        "LOCALAPPDATA",
+        &["Amazon Games", "App", "Amazon Games.exe"],
+    ))
+}
+
+fn detect_ea() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let mut candidates = vec![];
+    for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        candidates.extend(env_path(
+            var,
+            &[
+                "Electronic Arts",
+                "EA Desktop",
+                "EA Desktop",
+                "EADesktop.exe",
+            ],
+        ));
+        candidates.extend(env_path(var, &["Origin", "Origin.exe"]));
+    }
+    first_existing(candidates)
+}
+
+fn detect_battlenet() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    first_existing(
+        ["ProgramFiles(x86)", "ProgramFiles"]
+            .into_iter()
+            .filter_map(|var| env_path(var, &["Battle.net", "Battle.net.exe"])),
+    )
+}
+
+fn detect_itch() -> Option<PathBuf> {
+    if cfg!(windows) {
+        first_existing(env_path("LOCALAPPDATA", &["itch", "itch.exe"]))
+    } else {
+        let home = std::env::var_os("HOME")?;
+        let home = Path::new(&home);
+        first_existing([
+            home.join(".itch").join("itch"),
+            home.join(".local")
+                .join("share")
+                .join("flatpak")
+                .join("exports")
+                .join("bin")
+                .join("io.itch.itch"),
+            PathBuf::from("/var/lib/flatpak/exports/bin/io.itch.itch"),
+        ])
+    }
+}
+
+fn detect_heroic() -> Option<Heroic> {
+    if cfg!(windows) {
+        return None;
+    }
+    if let Some(path) = find_in_path("heroic") {
+        return Some(Heroic::Native(path));
+    }
+    if let Some(path) = first_existing([PathBuf::from("/opt/Heroic/heroic")]) {
+        return Some(Heroic::Native(path));
+    }
+    let flatpak_installed = [
+        std::env::var_os("HOME").map(|home| {
+            Path::new(&home).join(".local/share/flatpak/app/com.heroicgameslauncher.hgl")
+        }),
+        Some(PathBuf::from(
+            "/var/lib/flatpak/app/com.heroicgameslauncher.hgl",
+        )),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|path| path.exists());
+    flatpak_installed.then_some(Heroic::Flatpak)
+}
+
+/// Heroic keeps a sign-in file per store (Legendary, GOG, Nile), natively or in its Flatpak.
+fn detect_heroic_stores() -> Vec<StoreId> {
+    if cfg!(windows) {
+        return vec![];
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return vec![];
+    };
+    let home = Path::new(&home);
+    let config_dirs = [
+        home.join(".config").join("heroic"),
+        home.join(".var/app/com.heroicgameslauncher.hgl/config/heroic"),
+    ];
+    let sign_in_files = [
+        (StoreId::Epic, "legendaryConfig/legendary/user.json"),
+        (StoreId::Gog, "gog_store/auth.json"),
+        (StoreId::Amazon, "nile_config/nile/user.json"),
+    ];
+    sign_in_files
+        .into_iter()
+        .filter(|(_, file)| config_dirs.iter().any(|dir| dir.join(file).is_file()))
+        .map(|(store, _)| store)
+        .collect()
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn game(store: StoreId, id: &str) -> OwnedGame {
+        OwnedGame::new(store, id, "Some Game")
+    }
+
+    fn linux() -> Launchers {
+        Launchers {
+            opener: Opener::XdgOpen,
+            ..Default::default()
+        }
+    }
+
+    fn windows() -> Launchers {
+        Launchers {
+            opener: Opener::Explorer(PathBuf::from("C:\\Windows\\explorer.exe")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn without_launchers_opens_the_store_page() {
+        let gog = game(StoreId::Gog, "1207658924").with_extra("slug", "unreal_gold");
+        let target = target(&gog, InstallWith::Auto, &linux());
+        assert_eq!(target.exe, "xdg-open");
+        assert_eq!(
+            target.launch_options,
+            "\"https://www.gog.com/game/unreal_gold\""
+        );
+    }
+
+    #[test]
+    fn epic_launcher_gets_the_install_link() {
+        let epic = game(StoreId::Epic, "Fortnite")
+            .with_extra("namespace", "fn")
+            .with_extra("catalog_item_id", "4fe75bbc5a674f4f9b356b5c90567da5");
+        let launchers = Launchers {
+            epic: Some(PathBuf::from("C:\\Epic\\EpicGamesLauncher.exe")),
+            ..windows()
+        };
+        let target = target(&epic, InstallWith::Auto, &launchers);
+        assert_eq!(target.exe, "\"C:\\Epic\\EpicGamesLauncher.exe\"");
+        assert_eq!(
+            target.launch_options,
+            "com.epicgames.launcher://apps/fn%3A4fe75bbc5a674f4f9b356b5c90567da5%3AFortnite?action=launch&silent=true"
+        );
+    }
+
+    #[test]
+    fn heroic_is_used_on_linux_when_present() {
+        let launchers = Launchers {
+            heroic: Some(Heroic::Flatpak),
+            heroic_stores: vec![StoreId::Amazon],
+            ..linux()
+        };
+        // Heroic is not signed in to GOG, so GOG games open the store page.
+        assert_eq!(
+            target(&game(StoreId::Gog, "1"), InstallWith::Heroic, &launchers).exe,
+            "xdg-open"
+        );
+        let target = target(
+            &game(StoreId::Amazon, "amzn1.adg.product.x"),
+            InstallWith::Auto,
+            &launchers,
+        );
+        assert_eq!(target.exe, "flatpak");
+        assert!(target
+            .launch_options
+            .contains("heroic://launch/nile/amzn1.adg.product.x"));
+        // Stores Heroic doesn't handle fall back to the browser.
+        let humble = game(StoreId::Humble, "game_name")
+            .with_extra("url", "https://www.humblebundle.com/downloads?key=abc");
+        let target = super::target(&humble, InstallWith::Heroic, &launchers);
+        assert_eq!(
+            target.launch_options,
+            "\"https://www.humblebundle.com/downloads?key=abc\""
+        );
+    }
+
+    #[test]
+    fn browser_setting_skips_launchers() {
+        let launchers = Launchers {
+            galaxy: Some(PathBuf::from("C:\\GOG Galaxy\\GalaxyClient.exe")),
+            ..windows()
+        };
+        let gog = game(StoreId::Gog, "1");
+        assert!(target(&gog, InstallWith::Auto, &launchers)
+            .launch_options
+            .contains("goggalaxy://openGameView/1"));
+        assert_eq!(
+            target(&gog, InstallWith::Browser, &launchers).launch_options,
+            "\"https://www.gog.com/account\""
+        );
+    }
+
+    #[test]
+    fn shortcut_carries_identity_and_tags() {
+        let shortcut = owned_shortcut(&game(StoreId::Itch, "42"), InstallWith::Auto, &linux());
+        assert_eq!(shortcut.dev_kit_game_id, "boilr:itch:42");
+        assert!(shortcut.tags.contains(&"Not installed".to_string()));
+        assert_eq!(shortcut.app_name, "Some Game");
+    }
+}
