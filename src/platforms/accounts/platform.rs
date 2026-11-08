@@ -84,6 +84,12 @@ impl AccountPlatform {
     }
 }
 
+/// EA lists games the account has through a linked Steam or Epic account too; those belong
+/// to that store (Steam has them already, the Epic account adds them).
+fn include_game(game: &boilr_stores::OwnedGame) -> bool {
+    !matches!(game.extra("access"), Some("steam") | Some("epic"))
+}
+
 impl GamesPlatform for AccountPlatform {
     fn name(&self) -> &str {
         match self.store {
@@ -111,6 +117,7 @@ impl GamesPlatform for AccountPlatform {
         Ok(library
             .games
             .iter()
+            .filter(|game| include_game(game))
             .map(|game| ShortcutToImport {
                 shortcut: owned_shortcut(game, self.settings.install_with, &launchers),
                 needs_proton: false,

@@ -26,8 +26,8 @@ use reqwest::{cookie::Jar, Client, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    ea::cookie_jar, http, Cookie, LoginCapture, ManualLogin, OwnedGame, PendingLogin, Session,
-    StoreId,
+    http::{self, cookie_jar},
+    Cookie, LoginCapture, ManualLogin, OwnedGame, PendingLogin, Session, StoreId,
 };
 
 /// Starts the account site's OAuth sign-in. Also replayed on every refresh.

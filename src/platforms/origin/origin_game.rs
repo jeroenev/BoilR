@@ -74,6 +74,19 @@ fn make_launch_url(id: &str, launcher_location: &std::path::Path) -> String {
     }
 }
 
+/// The `.mfst` id is URL-encoded and may list several offers (`OFB-EAST%3a52735,...`).
+/// The first one is the game's own offer, which the EA account lists it under.
+fn first_offer_id(id: &str) -> Option<String> {
+    let decoded = url::form_urlencoded::parse(format!("id={id}").as_bytes())
+        .next()
+        .map(|(_, value)| value.into_owned())?;
+    decoded
+        .split(',')
+        .map(str::trim)
+        .find(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 impl From<EAGame> for ShortcutOwned {
     fn from(game: EAGame) -> Self {
         let url = launch_url(&game);
@@ -136,6 +149,9 @@ impl From<EAGame> for ShortcutOwned {
             launch.as_str(),
         )
         .to_owned();
+        if let Some(id) = first_offer_id(&game.id) {
+            owned_shortcut.dev_kit_game_id = crate::sync::shortcut_identity("ea", &id);
+        }
         owned_shortcut.tags.push("Origin/EA Desktop".to_owned());
         owned_shortcut.tags.push("Ready TO Play".to_owned());
         owned_shortcut.tags.push("Installed".to_owned());
@@ -199,5 +215,14 @@ mod tests {
         };
         let shortcut: ShortcutOwned = restart.into();
         assert!(shortcut.launch_options.ends_with(" --restart-launcher"));
+    }
+
+    #[test]
+    fn reads_the_first_offer_of_a_manifest_id() {
+        assert_eq!(
+            first_offer_id("OFB-EAST%3a52735,OFB-EAST%3a1"),
+            Some("OFB-EAST:52735".to_string())
+        );
+        assert_eq!(first_offer_id(""), None);
     }
 }

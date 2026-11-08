@@ -134,15 +134,19 @@ fn launcher_target(game: &OwnedGame, launchers: &Launchers) -> Option<Target> {
             ))
         }
         StoreId::Ea => {
-            let launcher = launchers.ea.as_ref()?;
-            Some(open_link(launchers, &ea_install_link(game, launcher)))
+            launchers.ea.as_ref()?;
+            Some(open_link(launchers, &ea_install_link(game)))
         }
         StoreId::BattleNet => {
             let launcher = launchers.battlenet.as_ref()?;
+            // Classic CD-key games (Warcraft III, Diablo II) have no launcher install.
+            let internal_id = game
+                .extra("internal_id")
+                .filter(|_| game.extra("launcher") != Some("false"))?;
             Some(Target {
                 exe: quoted(launcher),
                 start_dir: parent_dir(launcher),
-                launch_options: format!("--game={}", game.id),
+                launch_options: format!("--game={internal_id}"),
             })
         }
         StoreId::Itch => {
@@ -169,20 +173,11 @@ fn epic_install_link(game: &OwnedGame) -> String {
     }
 }
 
-fn ea_install_link(game: &OwnedGame, launcher: &Path) -> String {
-    let ea_app = launcher
-        .file_name()
-        .map(|name| {
-            name.to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("eadesktop")
-        })
-        .unwrap_or(true);
-    if ea_app {
-        format!("link2ea://launchgame/{}", game.id)
-    } else {
-        format!("origin2://game/launch?offerIds={}&autoDownload=1", game.id)
-    }
+/// The EA app (and Origin before it) opens its install dialog for this link when the game
+/// is not installed (Jeshibu's EaLibrary, `EaControllerHelper.cs` and `EaInstallController.cs`).
+fn ea_install_link(game: &OwnedGame) -> String {
+    let id = game.extra("content_id").unwrap_or(&game.id);
+    format!("origin2://game/launch/?offerIds={id}")
 }
 
 /// Heroic handles Epic (Legendary), GOG and Amazon (Nile) games; `heroic://launch` asks to
@@ -522,6 +517,32 @@ mod tests {
         assert_eq!(
             target(&gog, InstallWith::Browser, &launchers).launch_options,
             "\"https://www.gog.com/account\""
+        );
+    }
+
+    #[test]
+    fn ea_and_battlenet_use_their_launchers() {
+        let launchers = Launchers {
+            ea: Some(PathBuf::from("C:\\EA\\EADesktop.exe")),
+            battlenet: Some(PathBuf::from("C:\\Battle.net\\Battle.net.exe")),
+            ..windows()
+        };
+        let ea = game(StoreId::Ea, "Origin.OFR.50.0002694").with_extra("content_id", "1234");
+        assert_eq!(
+            target(&ea, InstallWith::Auto, &launchers).launch_options,
+            "\"origin2://game/launch/?offerIds=1234\""
+        );
+        let overwatch = game(StoreId::BattleNet, "Pro").with_extra("internal_id", "prometheus");
+        assert_eq!(
+            target(&overwatch, InstallWith::Auto, &launchers).launch_options,
+            "--game=prometheus"
+        );
+        let classic = game(StoreId::BattleNet, "W3")
+            .with_extra("internal_id", "w3")
+            .with_extra("launcher", "false");
+        assert_eq!(
+            target(&classic, InstallWith::Auto, &launchers).launch_options,
+            "\"https://download.battle.net/\""
         );
     }
 

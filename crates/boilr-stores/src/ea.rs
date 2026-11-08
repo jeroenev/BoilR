@@ -21,12 +21,15 @@
 //! - `access`: how the account has the game, one of `ea` (bought on EA), `steam` or `epic`
 //!   (bought there and linked to the EA account), `ea_play` or `game_pass` (subscription).
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
-use reqwest::{cookie::Jar, Client};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::{http, Cookie, LoginCapture, ManualLogin, OwnedGame, PendingLogin, Session, StoreId};
+use crate::{
+    http::{self, cookie_jar},
+    Cookie, LoginCapture, ManualLogin, OwnedGame, PendingLogin, Session, StoreId,
+};
 
 const LOGIN_URL: &str = "https://www.ea.com/login";
 /// EA's site redirects here (with `?code=…`) once accounts.ea.com accepted the sign-in.
@@ -529,102 +532,6 @@ fn parse_player_name(body: &str) -> Option<String> {
         .player?
         .display_name
         .filter(|n| !n.trim().is_empty())
-}
-
-/// A client whose cookie jar is seeded from a saved session, so cookies follow redirects and
-/// cookies a store renews can be read back into the session. Shared with the other
-/// cookie-session stores (Battle.net).
-pub(crate) mod cookie_jar {
-    use super::*;
-
-    pub(crate) fn client_with(cookies: &[Cookie]) -> eyre::Result<(Client, Arc<Jar>)> {
-        let jar = Arc::new(Jar::default());
-        for cookie in cookies {
-            add(&jar, cookie);
-        }
-        let client = Client::builder()
-            .user_agent(http::BROWSER_USER_AGENT)
-            .cookie_provider(jar.clone())
-            .timeout(std::time::Duration::from_secs(60))
-            .build()?;
-        Ok((client, jar))
-    }
-
-    /// Webviews report domain cookies with a leading dot (`.ea.com`) and host-only cookies
-    /// without (`accounts.ea.com`). Host-only cookies stay host-only, so a cookie the store
-    /// renews replaces the saved one instead of being sent next to it.
-    fn add(jar: &Jar, cookie: &Cookie) {
-        let host = cookie.domain.trim_start_matches('.');
-        if host.is_empty() || cookie.name.is_empty() {
-            return;
-        }
-        let Ok(url) = url::Url::parse(&format!("https://{host}/")) else {
-            return;
-        };
-        let attributes = if cookie.domain.starts_with('.') {
-            format!("Domain={host}; Path=/")
-        } else {
-            "Path=/".to_string()
-        };
-        jar.add_cookie_str(
-            &format!("{}={}; {attributes}", cookie.name, cookie.value),
-            &url,
-        );
-    }
-
-    /// The `name=value` pairs the jar would send to `host`.
-    pub(crate) fn pairs_for(jar: &Jar, host: &str) -> Vec<(String, String)> {
-        use reqwest::cookie::CookieStore;
-        let Ok(url) = url::Url::parse(&format!("https://{host}/")) else {
-            return vec![];
-        };
-        let Some(header) = jar.cookies(&url) else {
-            return vec![];
-        };
-        header
-            .to_str()
-            .unwrap_or_default()
-            .split(';')
-            .filter_map(|pair| {
-                let (name, value) = pair.trim().split_once('=')?;
-                Some((name.to_string(), value.to_string()))
-            })
-            .collect()
-    }
-
-    /// Copies renewed cookie values from the jar into `cookies`, and adds cookies the stores
-    /// set for `hosts` since.
-    pub(crate) fn refresh(cookies: &mut Vec<Cookie>, jar: &Jar, hosts: &[&str]) {
-        for host in hosts {
-            for (name, value) in pairs_for(jar, host) {
-                match cookies
-                    .iter_mut()
-                    .find(|c| c.name == name && http::domain_matches(&c.domain, host))
-                {
-                    Some(existing) => existing.value = value,
-                    None => cookies.push(Cookie {
-                        name,
-                        value,
-                        domain: host.to_string(),
-                    }),
-                }
-            }
-        }
-    }
-
-    /// The cookies of `domain` and its subdomains, one per name and domain (the last wins).
-    pub(crate) fn keep_domain(cookies: &[Cookie], domain: &str) -> Vec<Cookie> {
-        let mut kept: Vec<Cookie> = Vec::new();
-        for cookie in cookies {
-            let host = cookie.domain.trim_start_matches('.');
-            if host.is_empty() || !http::domain_matches(domain, host) {
-                continue;
-            }
-            kept.retain(|c| !(c.name == cookie.name && c.domain == cookie.domain));
-            kept.push(cookie.clone());
-        }
-        kept
-    }
 }
 
 #[cfg(test)]
