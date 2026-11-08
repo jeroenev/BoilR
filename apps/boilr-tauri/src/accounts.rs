@@ -295,13 +295,15 @@ async fn collect_cookies(app: &AppHandle, label: &str, urls: &[String]) -> Vec<s
             };
             let host = parsed.host_str().unwrap_or_default().to_string();
             match window.cookies_for_url(parsed) {
-                Ok(found) => cookies.extend(found.into_iter().map(|cookie| stores::Cookie {
-                    name: cookie.name().to_string(),
-                    value: cookie.value().to_string(),
-                    domain: cookie
-                        .domain()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| host.clone()),
+                Ok(found) => cookies.extend(found.into_iter().map(|cookie| {
+                    stores::Cookie {
+                        name: cookie.name().to_string(),
+                        value: cookie.value().to_string(),
+                        domain: cookie
+                            .domain()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| host.clone()),
+                    }
                 })),
                 Err(err) => eprintln!("Could not read cookies for {url}: {err}"),
             }
