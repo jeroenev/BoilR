@@ -164,8 +164,34 @@ pub async fn fetch_owned(client: &Client, session: &mut Session) -> eyre::Result
     }
 
     let entries = library_entries(records);
-    let catalog = fetch_catalog(client, &data.access_token, catalog_batches(&entries)).await?;
-    Ok(owned_games(&entries, &catalog))
+    let lookup = fetch_catalog(client, &data.access_token, catalog_batches(&entries)).await;
+    if lookup.found.is_empty() && !entries.is_empty() {
+        if let Some(err) = lookup.error {
+            return Err(err);
+        }
+    }
+    let mut games = owned_games(&entries, &lookup.found);
+    if !lookup.failed.is_empty() {
+        // A game whose lookup failed this time stays as the last library had it, so a
+        // passing service error never removes it from Steam.
+        let previous = crate::cached_library(StoreId::Epic).unwrap_or_default();
+        games.extend(previous_games(&entries, &lookup.failed, &previous.games));
+    }
+    Ok(games)
+}
+
+/// The previous library's entries for the games whose catalog lookup failed.
+fn previous_games(
+    entries: &[LibraryEntry],
+    failed: &BTreeSet<CatalogKey>,
+    previous: &[OwnedGame],
+) -> Vec<OwnedGame> {
+    entries
+        .iter()
+        .filter(|entry| failed.contains(&(entry.namespace.clone(), entry.catalog_item_id.clone())))
+        .filter_map(|entry| previous.iter().find(|game| game.id == entry.app_name))
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -536,35 +562,60 @@ fn catalog_batches(entries: &[LibraryEntry]) -> Vec<(String, Vec<String>)> {
 
 type CatalogKey = (String, String);
 
+/// What a catalog lookup found, and which items it could not look up because a request
+/// failed (as opposed to items the service does not know).
+#[derive(Default)]
+struct CatalogLookup {
+    found: BTreeMap<CatalogKey, CatalogItem>,
+    failed: BTreeSet<CatalogKey>,
+    /// The first request error, reported when nothing could be looked up.
+    error: Option<eyre::Report>,
+}
+
 /// Looks up catalog items, [`CATALOG_CONCURRENCY`] requests at a time. Ids a batched request
-/// did not answer are asked for one by one, so this works whether or not the service honours
-/// several `id` parameters in one request.
+/// did not answer, or whose request failed, are asked for one by one, so this works whether
+/// or not the service honours several `id` parameters in one request, and one failed request
+/// does not hide the other games.
 async fn fetch_catalog(
     client: &Client,
     access_token: &str,
     batches: Vec<(String, Vec<String>)>,
-) -> eyre::Result<BTreeMap<CatalogKey, CatalogItem>> {
-    let mut found = run_catalog_requests(client, access_token, batches.clone()).await?;
+) -> CatalogLookup {
+    let first = run_catalog_requests(client, access_token, batches.clone()).await;
     let mut retries = Vec::new();
-    for (namespace, ids) in batches.into_iter().filter(|(_, ids)| ids.len() > 1) {
+    for (namespace, ids) in batches {
+        let failed = ids
+            .iter()
+            .any(|id| first.failed.contains(&(namespace.clone(), id.clone())));
+        if ids.len() <= 1 && !failed {
+            continue;
+        }
         for id in ids {
-            if !found.contains_key(&(namespace.clone(), id.clone())) {
+            if !first.found.contains_key(&(namespace.clone(), id.clone())) {
                 retries.push((namespace.clone(), vec![id]));
             }
         }
     }
+    let mut lookup = CatalogLookup {
+        found: first.found,
+        failed: BTreeSet::new(),
+        error: first.error,
+    };
     if !retries.is_empty() {
-        found.extend(run_catalog_requests(client, access_token, retries).await?);
+        let retried = run_catalog_requests(client, access_token, retries).await;
+        lookup.found.extend(retried.found);
+        lookup.failed = retried.failed;
+        lookup.error = lookup.error.or(retried.error);
     }
-    Ok(found)
+    lookup
 }
 
 async fn run_catalog_requests(
     client: &Client,
     access_token: &str,
     batches: Vec<(String, Vec<String>)>,
-) -> eyre::Result<BTreeMap<CatalogKey, CatalogItem>> {
-    let mut found = BTreeMap::new();
+) -> CatalogLookup {
+    let mut lookup = CatalogLookup::default();
     let mut pending = batches.into_iter();
     let mut tasks = JoinSet::new();
     loop {
@@ -575,21 +626,34 @@ async fn run_catalog_requests(
             let client = client.clone();
             let access_token = access_token.to_string();
             tasks.spawn(async move {
-                let items = fetch_catalog_batch(&client, &access_token, &namespace, &ids).await?;
-                Ok::<_, eyre::Report>((namespace, items))
+                let items = fetch_catalog_batch(&client, &access_token, &namespace, &ids).await;
+                (namespace, ids, items)
             });
         }
         let Some(joined) = tasks.join_next().await else {
             break;
         };
-        // Returning drops `tasks`, which cancels the requests still running.
-        let (namespace, items) =
-            joined.map_err(|err| eyre::format_err!("Looking up Epic games failed: {err}"))??;
-        for (id, item) in items {
-            found.insert((namespace.clone(), id), item);
+        match joined {
+            Ok((namespace, _, Ok(items))) => {
+                for (id, item) in items {
+                    lookup.found.insert((namespace.clone(), id), item);
+                }
+            }
+            Ok((namespace, ids, Err(err))) => {
+                eprintln!("Looking up Epic games in {namespace} failed: {err:?}");
+                lookup
+                    .failed
+                    .extend(ids.into_iter().map(|id| (namespace.clone(), id)));
+                lookup.error.get_or_insert(err);
+            }
+            Err(err) => {
+                lookup
+                    .error
+                    .get_or_insert(eyre::format_err!("Looking up Epic games failed: {err}"));
+            }
         }
     }
-    Ok(found)
+    lookup
 }
 
 async fn fetch_catalog_batch(
@@ -740,6 +804,33 @@ mod tests {
     const LIBRARY_1: &str = include_str!("../testdata/epic/library_page1.json");
     const LIBRARY_2: &str = include_str!("../testdata/epic/library_page2.json");
     const CATALOG: &str = include_str!("../testdata/epic/catalog_bulk.json");
+
+    #[test]
+    fn games_whose_lookup_failed_come_from_the_previous_library() {
+        let entry = |app: &str, item: &str| LibraryEntry {
+            app_name: app.to_string(),
+            namespace: "ns".to_string(),
+            catalog_item_id: item.to_string(),
+        };
+        let entries = vec![
+            entry("Fortnite", "a"),
+            entry("Rocket", "b"),
+            entry("New", "c"),
+        ];
+        let failed: BTreeSet<CatalogKey> = [("ns", "a"), ("ns", "c")]
+            .into_iter()
+            .map(|(ns, id)| (ns.to_string(), id.to_string()))
+            .collect();
+        let previous = vec![
+            OwnedGame::new(StoreId::Epic, "Fortnite", "Fortnite"),
+            OwnedGame::new(StoreId::Epic, "Rocket", "Rocket League"),
+        ];
+
+        let kept = previous_games(&entries, &failed, &previous);
+
+        let titles: Vec<&str> = kept.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, ["Fortnite"]);
+    }
 
     #[test]
     fn login_urls_never_match_done_prefixes() -> eyre::Result<()> {

@@ -1,4 +1,4 @@
-use boilr_stores::{self as stores, OwnedLibrary, PendingLogin, StoreId};
+use boilr_stores::{self as stores, OwnedLibrary, StoreId};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -33,13 +33,11 @@ pub struct AccountSettings {
 pub struct AccountPlatform {
     pub store: StoreId,
     pub settings: AccountSettings,
-    // Sign-in state of the egui settings panel.
-    #[cfg_attr(not(feature = "egui-ui"), allow(dead_code))]
-    pending: Option<PendingLogin>,
-    #[cfg_attr(not(feature = "egui-ui"), allow(dead_code))]
+    // State of the egui settings panel, shared with its background tasks.
+    #[cfg(feature = "egui-ui")]
+    panel: std::sync::Arc<std::sync::Mutex<Panel>>,
+    #[cfg(feature = "egui-ui")]
     pasted: String,
-    #[cfg_attr(not(feature = "egui-ui"), allow(dead_code))]
-    message: Option<String>,
 }
 
 impl AccountPlatform {
@@ -47,40 +45,25 @@ impl AccountPlatform {
         AccountPlatform {
             store,
             settings: load_settings(settings),
-            pending: None,
+            #[cfg(feature = "egui-ui")]
+            panel: Default::default(),
+            #[cfg(feature = "egui-ui")]
             pasted: String::new(),
-            message: None,
         }
     }
 
-    /// The cached library, fetched again first when it is older than [`LIBRARY_MAX_AGE_SECS`].
-    /// A failed fetch falls back to the cached library, so a network problem never removes
-    /// the account's games from Steam.
+    /// The cached library, fetched again first when it is older than
+    /// [`LIBRARY_MAX_AGE_SECS`]. A failed fetch falls back to the cached library, so a
+    /// network problem never removes the account's games from Steam.
     pub fn library(&self) -> eyre::Result<OwnedLibrary> {
         let store = self.store;
-        let cached = stores::load_library(store)?;
-        let signed_in = stores::load_session(store)?.is_some();
-        if !signed_in {
+        if stores::load_session(store)?.is_none() {
             return Err(eyre::format_err!(
                 "Not signed in to {}. Sign in from this source's settings.",
                 store.display_name()
             ));
         }
-        if stores::is_stale(cached.as_ref(), LIBRARY_MAX_AGE_SECS) {
-            let fetched = block_on_fresh(stores::refresh_library(store)).and_then(|r| r);
-            match (fetched, cached) {
-                (Ok(library), _) => return Ok(library),
-                (Err(err), Some(cached)) => {
-                    eprintln!(
-                        "Could not refresh the {} library, using the one from before: {err:?}",
-                        store.display_name()
-                    );
-                    return Ok(cached);
-                }
-                (Err(err), None) => return Err(err),
-            }
-        }
-        cached.ok_or_else(|| eyre::format_err!("No library fetched yet"))
+        block_on_fresh(stores::refresh_if_stale(store, LIBRARY_MAX_AGE_SECS))?
     }
 }
 
@@ -137,18 +120,80 @@ impl GamesPlatform for AccountPlatform {
     }
 }
 
+/// What the egui settings panel shows. Sign-in and refresh run on a background thread and
+/// report here, so the window never waits on the network.
+#[cfg(feature = "egui-ui")]
+#[derive(Default)]
+struct Panel {
+    /// Read from disk once, and again after every change.
+    status: Option<stores::AccountStatus>,
+    busy: bool,
+    message: Option<String>,
+    /// A sign-in finished: turn the account on as a source.
+    signed_in: bool,
+}
+
+#[cfg(feature = "egui-ui")]
+fn lock_panel(panel: &std::sync::Mutex<Panel>) -> std::sync::MutexGuard<'_, Panel> {
+    panel
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(feature = "egui-ui")]
 impl AccountPlatform {
+    /// Runs `work` on a background thread; its message shows in the panel when it is done.
+    /// `work` returns the message and whether the account is now signed in.
+    fn run_in_background<F>(&self, ctx: &egui::Context, work: F)
+    where
+        F: FnOnce() -> (String, bool) + Send + 'static,
+    {
+        {
+            let mut panel = lock_panel(&self.panel);
+            if panel.busy {
+                return;
+            }
+            panel.busy = true;
+            panel.message = None;
+        }
+        let panel = self.panel.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let (message, signed_in) = work();
+            {
+                let mut panel = lock_panel(&panel);
+                panel.busy = false;
+                panel.message = Some(message);
+                panel.signed_in |= signed_in;
+                panel.status = None;
+            }
+            ctx.request_repaint();
+        });
+    }
+
     fn render_account_ui(&mut self, ui: &mut egui::Ui) {
         use boilr_stores::{LoginCapture, ManualLogin};
 
         let store = self.store;
+        let (status, busy, message) = {
+            let mut panel = lock_panel(&self.panel);
+            if panel.signed_in {
+                panel.signed_in = false;
+                self.settings.enabled = true;
+                self.pasted.clear();
+            }
+            let status = panel
+                .status
+                .get_or_insert_with(|| stores::account_status(store))
+                .clone();
+            (status, panel.busy, panel.message.clone())
+        };
+
         ui.heading(self.name().to_string());
         ui.checkbox(
             &mut self.settings.enabled,
             "Add every game this account owns, installed or not",
         );
-        let status = stores::account_status(store);
         if status.signed_in {
             let who = status
                 .account_name
@@ -160,25 +205,29 @@ impl AccountPlatform {
             };
             ui.label(format!("Signed in as {who}, {games}."));
             ui.horizontal(|ui| {
-                if ui.button("Refresh library").clicked() {
-                    self.message = Some(match block_on_fresh(stores::refresh_library(store)) {
-                        Ok(Ok(library)) => format!("Found {} games.", library.games.len()),
-                        Ok(Err(err)) | Err(err) => format!("Could not refresh: {err}"),
-                    });
-                }
-                if ui.button("Sign out").clicked() {
-                    self.message = Some(match stores::delete_account(store) {
-                        Ok(()) => "Signed out.".to_string(),
-                        Err(err) => format!("Could not sign out: {err}"),
-                    });
-                }
+                ui.add_enabled_ui(!busy, |ui| {
+                    if ui.button("Refresh library").clicked() {
+                        self.run_in_background(ui.ctx(), move || {
+                            let message = match block_on_fresh(stores::refresh_library(store)) {
+                                Ok(Ok(library)) => format!("Found {} games.", library.games.len()),
+                                Ok(Err(err)) | Err(err) => format!("Could not refresh: {err}"),
+                            };
+                            (message, false)
+                        });
+                    }
+                    if ui.button("Sign out").clicked() {
+                        let message = match stores::delete_account(store) {
+                            Ok(()) => "Signed out.".to_string(),
+                            Err(err) => format!("Could not sign out: {err}"),
+                        };
+                        let mut panel = lock_panel(&self.panel);
+                        panel.message = Some(message);
+                        panel.status = None;
+                    }
+                });
             });
         } else {
-            let pending = self
-                .pending
-                .get_or_insert_with(|| stores::begin_login(store))
-                .clone();
-            match &pending.manual {
+            match &status.manual {
                 ManualLogin::Paste {
                     url,
                     instructions,
@@ -191,26 +240,42 @@ impl AccountPlatform {
                             egui::TextEdit::singleline(&mut self.pasted)
                                 .hint_text(placeholder.as_str()),
                         );
-                        if ui.button("Sign in").clicked() {
-                            let capture = LoginCapture {
-                                pasted: Some(self.pasted.trim().to_string()),
-                                ..Default::default()
-                            };
-                            let result = block_on_fresh(stores::complete_login(&pending, &capture))
-                                .and_then(|r| r);
-                            self.message = Some(match result {
-                                Ok(name) => {
-                                    self.pasted.clear();
-                                    self.pending = None;
-                                    self.settings.enabled = true;
-                                    format!(
-                                        "Signed in{}.",
-                                        name.map(|n| format!(" as {n}")).unwrap_or_default()
-                                    )
-                                }
-                                Err(err) => format!("Could not sign in: {err}"),
-                            });
-                        }
+                        ui.add_enabled_ui(!busy, |ui| {
+                            if ui.button("Sign in").clicked() {
+                                // The same pending login as the link above: Amazon's sign-in
+                                // link carries its PKCE challenge.
+                                let pending = stores::pending_login(store);
+                                let capture = LoginCapture {
+                                    pasted: Some(self.pasted.trim().to_string()),
+                                    ..Default::default()
+                                };
+                                self.run_in_background(ui.ctx(), move || {
+                                    let signed_in = block_on_fresh(async {
+                                        let name =
+                                            stores::complete_login(&pending, &capture).await?;
+                                        if let Err(err) = stores::refresh_library(store).await {
+                                            eprintln!(
+                                                "Could not fetch the {} library: {err:?}",
+                                                store.key()
+                                            );
+                                        }
+                                        Ok::<_, eyre::Report>(name)
+                                    })
+                                    .and_then(|r| r);
+                                    match signed_in {
+                                        Ok(name) => (
+                                            format!(
+                                                "Signed in{}.",
+                                                name.map(|n| format!(" as {n}"))
+                                                    .unwrap_or_default()
+                                            ),
+                                            true,
+                                        ),
+                                        Err(err) => (format!("Could not sign in: {err}"), false),
+                                    }
+                                });
+                            }
+                        });
                     });
                 }
                 ManualLogin::Unsupported => {
@@ -246,7 +311,10 @@ impl AccountPlatform {
                     "the store's web page",
                 );
             });
-        if let Some(message) = &self.message {
+        if busy {
+            ui.spinner();
+        }
+        if let Some(message) = &message {
             ui.label(message);
         }
     }

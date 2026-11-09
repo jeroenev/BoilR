@@ -24,11 +24,14 @@ pub mod humble;
 pub mod itch;
 mod storage;
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+};
 
 use serde::{Deserialize, Serialize};
 
-pub use storage::{delete_account, load_library, load_session, save_library, save_session};
+pub use storage::{load_library, load_session, save_library, save_session};
 
 /// A store BoilR can sign in to. The `key` is used in file names and settings; never change it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -176,7 +179,7 @@ pub struct PendingLogin {
     /// launcher's own (Epic's captcha only passes for the Epic Games Launcher's).
     #[serde(default)]
     pub user_agent: Option<String>,
-    /// Store-private state carried from [`begin_login`] to [`complete_login`] (PKCE
+    /// Store-private state carried from [`pending_login`] to [`complete_login`] (PKCE
     /// verifiers, device serials).
     #[serde(default)]
     pub state: serde_json::Value,
@@ -194,8 +197,32 @@ pub struct LoginCapture {
     pub pasted: Option<String>,
 }
 
-/// Starts a login.
-pub fn begin_login(store: StoreId) -> PendingLogin {
+/// The sign-in in progress per store. A login started in one place (a window, a link the
+/// user opens in their browser) is finished in another (a pasted value), so both must use
+/// the same [`PendingLogin`]: Amazon's PKCE verifier and device serial live in its state.
+static PENDING_LOGINS: Mutex<BTreeMap<StoreId, PendingLogin>> = Mutex::new(BTreeMap::new());
+
+/// The sign-in in progress for `store`, started on first use. [`complete_login`] ends it
+/// when it succeeds; until then every caller gets the same one.
+pub fn pending_login(store: StoreId) -> PendingLogin {
+    let mut pending = PENDING_LOGINS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    pending
+        .entry(store)
+        .or_insert_with(|| begin_login(store))
+        .clone()
+}
+
+fn end_pending_login(store: StoreId) {
+    PENDING_LOGINS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&store);
+}
+
+/// Starts a new login. Front ends use [`pending_login`], which keeps one per store.
+fn begin_login(store: StoreId) -> PendingLogin {
     match store {
         StoreId::Epic => epic::begin_login(),
         StoreId::Gog => gog::begin_login(),
@@ -223,12 +250,115 @@ pub async fn complete_login(
         StoreId::Itch => itch::complete_login(&client, pending, capture).await,
     }?;
     save_session(pending.store, &session)?;
+    end_pending_login(pending.store);
     Ok(session.account_name)
+}
+
+/// One lock per store: two refreshes of the same account at once would both use (and
+/// rotate) the same refresh token and both write the same files.
+fn refresh_lock(store: StoreId) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<BTreeMap<StoreId, Arc<tokio::sync::Mutex<()>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(|| {
+            StoreId::ALL
+                .into_iter()
+                .map(|store| (store, Arc::new(tokio::sync::Mutex::new(()))))
+                .collect()
+        })
+        .get(&store)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// When a refresh of each store last failed (Unix seconds), so listing games does not retry
+/// an unreachable store on every call.
+static LAST_FAILURE: Mutex<BTreeMap<StoreId, u64>> = Mutex::new(BTreeMap::new());
+
+/// How long [`refresh_if_stale`] waits after a failed refresh before it tries again.
+pub const RETRY_AFTER_FAILURE_SECS: u64 = 15 * 60;
+
+fn record_failure(store: StoreId, failed: bool) {
+    let mut failures = LAST_FAILURE.lock().unwrap_or_else(PoisonError::into_inner);
+    if failed {
+        failures.insert(store, now_unix());
+    } else {
+        failures.remove(&store);
+    }
+}
+
+fn failed_recently(store: StoreId) -> bool {
+    LAST_FAILURE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&store)
+        .is_some_and(|at| now_unix().saturating_sub(*at) < RETRY_AFTER_FAILURE_SECS)
+}
+
+/// The cached library, or `None` when there is none or it can't be read (a damaged file is
+/// replaced by the next refresh instead of breaking the account).
+pub fn cached_library(store: StoreId) -> Option<OwnedLibrary> {
+    match load_library(store) {
+        Ok(library) => library,
+        Err(err) => {
+            eprintln!(
+                "The saved {} library is unreadable, it will be fetched again: {err}",
+                store.display_name()
+            );
+            None
+        }
+    }
 }
 
 /// Fetches the owned games with the stored session, then stores the refreshed session and
 /// the library. On error the previous library stays, so a network problem never empties it.
 pub async fn refresh_library(store: StoreId) -> eyre::Result<OwnedLibrary> {
+    let lock = refresh_lock(store);
+    let _guard = lock.lock().await;
+    let result = refresh_library_locked(store).await;
+    record_failure(store, result.is_err());
+    result
+}
+
+/// The library for listing games: the cached one, fetched again first when it is older than
+/// `max_age_secs`. A failed fetch falls back to the cache and is not retried for
+/// [`RETRY_AFTER_FAILURE_SECS`]. Concurrent callers wait for one fetch instead of each
+/// making their own.
+pub async fn refresh_if_stale(store: StoreId, max_age_secs: u64) -> eyre::Result<OwnedLibrary> {
+    let cached = cached_library(store);
+    if !is_stale(cached.as_ref(), max_age_secs) || (cached.is_some() && failed_recently(store)) {
+        return cached.ok_or_else(|| eyre::format_err!("No library fetched yet"));
+    }
+    let lock = refresh_lock(store);
+    let _guard = lock.lock().await;
+    // Another caller may have fetched it while this one waited.
+    let cached = cached_library(store);
+    if !is_stale(cached.as_ref(), max_age_secs) {
+        return cached.ok_or_else(|| eyre::format_err!("No library fetched yet"));
+    }
+    if failed_recently(store) {
+        return cached.ok_or_else(|| {
+            eyre::format_err!(
+                "Could not fetch the {} library a moment ago; it is tried again later",
+                store.display_name()
+            )
+        });
+    }
+    let result = refresh_library_locked(store).await;
+    record_failure(store, result.is_err());
+    match (result, cached) {
+        (Ok(library), _) => Ok(library),
+        (Err(err), Some(cached)) => {
+            eprintln!(
+                "Could not refresh the {} library, using the one from before: {err:?}",
+                store.display_name()
+            );
+            Ok(cached)
+        }
+        (Err(err), None) => Err(err),
+    }
+}
+
+async fn refresh_library_locked(store: StoreId) -> eyre::Result<OwnedLibrary> {
     let mut session = load_session(store)?
         .ok_or_else(|| eyre::format_err!("Not signed in to {}", store.display_name()))?;
     let client = http::client()?;
@@ -256,6 +386,14 @@ pub async fn refresh_library(store: StoreId) -> eyre::Result<OwnedLibrary> {
     Ok(library)
 }
 
+/// Signs out: removes the session and the cached library.
+pub fn delete_account(store: StoreId) -> eyre::Result<()> {
+    storage::delete_account(store)?;
+    end_pending_login(store);
+    record_failure(store, false);
+    Ok(())
+}
+
 /// Whether a library is older than `max_age_secs` (or was never fetched).
 pub fn is_stale(library: Option<&OwnedLibrary>, max_age_secs: u64) -> bool {
     match library {
@@ -279,10 +417,12 @@ pub struct AccountStatus {
     pub webview_login: bool,
 }
 
+/// Reads the session and the cached library from disk; front ends call it after a change,
+/// not on every repaint.
 pub fn account_status(store: StoreId) -> AccountStatus {
     let session = load_session(store).ok().flatten();
     let library = load_library(store).ok().flatten();
-    let pending = begin_login(store);
+    let pending = pending_login(store);
     AccountStatus {
         store,
         key: store.key().to_string(),
@@ -303,4 +443,30 @@ pub fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sign_in_keeps_its_state_until_it_ends() {
+        // Amazon's sign-in link carries a PKCE challenge: the link the user opened and the
+        // login that finishes it must share the verifier.
+        let opened = pending_login(StoreId::Amazon);
+        let finished = pending_login(StoreId::Amazon);
+        assert_eq!(opened.start_url, finished.start_url);
+        assert_eq!(opened.state, finished.state);
+
+        end_pending_login(StoreId::Amazon);
+        assert_ne!(pending_login(StoreId::Amazon).state, opened.state);
+    }
+
+    #[test]
+    fn recent_failures_hold_off_retries() {
+        record_failure(StoreId::Humble, true);
+        assert!(failed_recently(StoreId::Humble));
+        record_failure(StoreId::Humble, false);
+        assert!(!failed_recently(StoreId::Humble));
+    }
 }

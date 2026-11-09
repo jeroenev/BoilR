@@ -90,10 +90,22 @@ pub(crate) fn owned_shortcut(
         &target.launch_options,
     )
     .to_owned();
-    shortcut.dev_kit_game_id = crate::sync::shortcut_identity(game.store.key(), &game.id);
+    let identity = owned_identity(game);
+    shortcut.app_id = crate::sync::owned_app_id(&shortcut.exe, &shortcut.app_name, &identity);
+    shortcut.dev_kit_game_id = format!("{}{identity}", crate::sync::IDENTITY_PREFIX);
     shortcut.tags.push(game.store.display_name().to_owned());
     shortcut.tags.push("Not installed".to_owned());
     shortcut
+}
+
+/// `<store>:<id>`, plus the other ids an installed copy may report instead (an EA game's
+/// manifest can name its content id rather than its offer id).
+fn owned_identity(game: &OwnedGame) -> String {
+    let mut ids = vec![game.id.as_str()];
+    if game.store == StoreId::Ea {
+        ids.extend(game.extra("content_id").filter(|c| !c.contains(',')));
+    }
+    format!("{}:{}", game.store.key(), ids.join(","))
 }
 
 pub(crate) fn target(game: &OwnedGame, install_with: InstallWith, launchers: &Launchers) -> Target {
@@ -454,6 +466,28 @@ mod tests {
             target.launch_options,
             "\"https://www.gog.com/game/unreal_gold\""
         );
+    }
+
+    #[test]
+    fn one_title_in_two_stores_gets_two_app_ids() {
+        let gog = OwnedGame::new(StoreId::Gog, "1454315831", "Fallout 3");
+        let epic = OwnedGame::new(
+            StoreId::Epic,
+            "adeae8bbfc94427db57c7dfecce3f1d4",
+            "Fallout 3",
+        );
+        let gog = owned_shortcut(&gog, InstallWith::Auto, &linux());
+        let epic = owned_shortcut(&epic, InstallWith::Auto, &linux());
+        assert_eq!(gog.exe, epic.exe);
+        assert_ne!(gog.app_id, epic.app_id);
+    }
+
+    #[test]
+    fn ea_identity_names_the_content_id_too() {
+        let ea = OwnedGame::new(StoreId::Ea, "OFB-EAST:52735", "Zuma's Revenge")
+            .with_extra("content_id", "1002139");
+        let shortcut = owned_shortcut(&ea, InstallWith::Auto, &linux());
+        assert_eq!(shortcut.dev_kit_game_id, "boilr:ea:OFB-EAST:52735,1002139");
     }
 
     #[test]

@@ -74,17 +74,12 @@ fn make_launch_url(id: &str, launcher_location: &std::path::Path) -> String {
     }
 }
 
-/// The `.mfst` id is URL-encoded and may list several offers (`OFB-EAST%3a52735,...`).
-/// The first one is the game's own offer, which the EA account lists it under.
-fn first_offer_id(id: &str) -> Option<String> {
-    let decoded = url::form_urlencoded::parse(format!("id={id}").as_bytes())
-        .next()
-        .map(|(_, value)| value.into_owned())?;
-    decoded
-        .split(',')
-        .map(str::trim)
-        .find(|id| !id.is_empty())
-        .map(str::to_string)
+/// Every id in the `.mfst` id (URL-encoded, possibly several offers). The first is the
+/// game's own offer; the account may list the game under any of them, and the sync matches
+/// an owned entry on any (see `accounts::drop_owned_duplicates`).
+fn manifest_identity(id: &str) -> Option<String> {
+    let ids = boilr_stores::ea::manifest_ids(id);
+    (!ids.is_empty()).then(|| crate::sync::shortcut_identity("ea", &ids.join(",")))
 }
 
 impl From<EAGame> for ShortcutOwned {
@@ -149,8 +144,8 @@ impl From<EAGame> for ShortcutOwned {
             launch.as_str(),
         )
         .to_owned();
-        if let Some(id) = first_offer_id(&game.id) {
-            owned_shortcut.dev_kit_game_id = crate::sync::shortcut_identity("ea", &id);
+        if let Some(identity) = manifest_identity(&game.id) {
+            owned_shortcut.dev_kit_game_id = identity;
         }
         owned_shortcut.tags.push("Origin/EA Desktop".to_owned());
         owned_shortcut.tags.push("Ready TO Play".to_owned());
@@ -218,11 +213,11 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_first_offer_of_a_manifest_id() {
+    fn identity_lists_every_offer_of_a_manifest_id() {
         assert_eq!(
-            first_offer_id("OFB-EAST%3a52735,OFB-EAST%3a1"),
-            Some("OFB-EAST:52735".to_string())
+            manifest_identity("OFB-EAST%3a52735,OFB-EAST%3a1"),
+            Some("boilr:ea:OFB-EAST:52735,OFB-EAST:1".to_string())
         );
-        assert_eq!(first_offer_id(""), None);
+        assert_eq!(manifest_identity(""), None);
     }
 }

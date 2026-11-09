@@ -15,10 +15,10 @@ They talk to the same store services.
 |---|---|---|
 | Store clients | `crates/boilr-stores` | Sign-in, session storage, owned-game lists. One module per store. No Steam, no UI. |
 | Account platforms | `src/platforms/accounts` | One `GamesPlatform` per store (`epic_account`, `gog_account`, ...). They turn the cached library into shortcuts. |
-| Identity and sticky app ids | `crates/boilr-core/src/sync/synchronization.rs` | Each shortcut gets `DevkitGameID = boilr:<store>:<id>`. A sync keeps the app id Steam already has for that identity. |
+| Identity and sticky app ids | `crates/boilr-core/src/sync/synchronization.rs` | Each shortcut gets `DevkitGameID = boilr:<store>:<id>`. A sync keeps the app id Steam already has for that identity. An identity can list more ids of the same game after commas (`ea:<offer>,<content id>`); the first id is the key. |
 | Login window | `apps/boilr-tauri/src/accounts.rs` | A private webview per store. When the store lands on its post-login page, BoilR stops the navigation, reads the cookies and the URL, and finishes the sign-in. |
 | Accounts screen | `apps/boilr-tauri/src/components/AccountsView.tsx` | Sign in, sign in with your own browser (paste), refresh, sign out, choose what not-installed games open. |
-| egui | `AccountPlatform::render_ui` | Paste sign-in for the stores that support it. EA and Battle.net need the login window, so they need the Tauri app. |
+| egui | `AccountPlatform::render_ui` | Paste sign-in for the stores that support it. Sign-in and refresh run on a background thread. EA and Battle.net need the login window, so they need the Tauri app. |
 
 ## Stores
 
@@ -37,13 +37,24 @@ Each store module documents its endpoints and the reference code they come from.
 ## What happens on a sync
 
 1. An account platform reads its cached library. If the cache is older than 6 hours and the
-   account is signed in, it fetches it again first. A failed fetch keeps the old cache, so a
-   network problem never removes games from Steam.
+   account is signed in, it fetches it again first (`stores::refresh_if_stale`). A failed
+   fetch keeps the old cache, so a network problem never removes games from Steam, and is
+   not retried for 15 minutes. One fetch per store runs at a time; callers that arrive
+   during a fetch wait for it and use its result. An unreadable cache counts as none.
+   Partial failures keep games too: an EA content-id lookup that fails leaves the content
+   ids out, and an Epic game whose catalog lookup fails keeps its entry from the last
+   library.
 2. Installed-game platforms (Epic, Legendary, GOG, Amazon, Heroic, itch, EA) report their
-   games with the same identity.
-3. `accounts::drop_owned_duplicates` drops owned entries whose game is installed.
+   games with the same identity. An installed EA game lists every offer id in its manifest.
+3. `accounts::drop_owned_duplicates` drops owned entries whose game is installed. They are
+   the same game when any of their ids match. The installed entry then takes the owned
+   entry's identity, so step 4 finds the owned shortcut's app id.
 4. The sync writes the shortcuts. A game whose identity is already in `shortcuts.vdf` keeps
    that app id, even though its target changed.
+
+An owned shortcut's app id is a hash of exe, name and identity, not of exe and name only.
+Owned shortcuts share their exe (`xdg-open`, a store launcher), and one title owned in two
+stores would otherwise get one app id. Renames and the Flatpak rewrite keep that scheme.
 5. Owned games go into the Steam collection "Not installed" when collections are on.
 
 ## Storage
@@ -64,8 +75,9 @@ Windows:
   - Epic's captcha in the login window. It uses the launcher's user agent, as Playnite does.
   - Amazon's sign-in page in a webview.
   - Which EA and Battle.net cookies keep the session alive.
-- **Steam honours a kept app id:** the one in `shortcuts.vdf` after the exe changes, across
-  restarts and property edits. Check on Windows and Linux.
+- **Steam honours the app id in `shortcuts.vdf`:** both the kept one after the exe changes
+  and the identity-based one every owned shortcut starts with, across restarts and property
+  edits. Check on Windows and Linux.
 - **Windows install links:**
   - Whether Epic `?action=launch` on a game that is not installed offers the install. The
     fallback is `store/library`.
@@ -73,7 +85,7 @@ Windows:
   - EA `origin2://` with a content id.
   - Battle.net `--game=`.
 - **Matching an installed copy to its owned entry:**
-  - EA: whether the `.mfst` id is the account's offer id.
+  - EA: whether one of the `.mfst` ids is the account's offer id or content id.
   - itch: whether butler's receipt carries the game id. Older installs without it simply
     don't match.
 - **Heroic on Linux:** used only when it is signed in to the same store. It finds the game

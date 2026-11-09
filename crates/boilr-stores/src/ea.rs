@@ -137,10 +137,15 @@ pub async fn fetch_owned(_client: &Client, session: &mut Session) -> eyre::Resul
         }
     }
 
+    // Content ids only improve the install link and matching installed copies; without
+    // them the offer id is used, so a failed lookup never fails the library.
     let offer_ids: Vec<String> = games.iter().map(|g| g.id.clone()).collect();
     let mut content_ids = HashMap::new();
     for batch in offer_ids.chunks(LEGACY_OFFER_BATCH) {
-        content_ids.extend(legacy_content_ids(&client, batch).await?);
+        match legacy_content_ids(&client, batch).await {
+            Ok(found) => content_ids.extend(found),
+            Err(err) => eprintln!("Could not look up EA content ids, using offer ids: {err:?}"),
+        }
     }
     Ok(games
         .into_iter()
@@ -151,22 +156,22 @@ pub async fn fetch_owned(_client: &Client, session: &mut Session) -> eyre::Resul
         .collect())
 }
 
-/// Whether an installed EA game belongs to this owned game. `installed_id` is the `id=` value
-/// of the game's `.mfst` manifest in `ProgramData/Origin/LocalContent`, as BoilR's installed EA
-/// platform reads it: URL-encoded, possibly several offer ids joined by commas
-/// (`OFB-EAST%3a52735`, `Origin.OFR.50.0002487%2cOrigin.OFR.50.0002412`).
-pub fn matches_installed_id(game: &OwnedGame, installed_id: &str) -> bool {
-    let decoded = url::form_urlencoded::parse(format!("id={installed_id}").as_bytes())
+/// The ids in the `id=` value of an installed EA game's `.mfst` manifest (in
+/// `ProgramData/Origin/LocalContent`), as BoilR's installed EA platform reads it: URL-encoded,
+/// possibly several offer ids joined by commas (`OFB-EAST%3a52735`,
+/// `Origin.OFR.50.0002487%2cOrigin.OFR.50.0002412`). The account lists the game under one of
+/// these, or under its content id.
+pub fn manifest_ids(manifest_id: &str) -> Vec<String> {
+    let decoded = url::form_urlencoded::parse(format!("id={manifest_id}").as_bytes())
         .next()
         .map(|(_, v)| v.into_owned())
-        .unwrap_or_else(|| installed_id.to_string());
-    decoded.split(',').map(str::trim).any(|id| {
-        !id.is_empty()
-            && (id.eq_ignore_ascii_case(&game.id)
-                || game
-                    .extra("content_id")
-                    .is_some_and(|content| id.eq_ignore_ascii_case(content)))
-    })
+        .unwrap_or_else(|| manifest_id.to_string());
+    decoded
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn access_token(client: &Client) -> eyre::Result<String> {
@@ -690,17 +695,13 @@ mod tests {
     }
 
     #[test]
-    fn matches_installed_manifest_ids() {
-        let game = OwnedGame::new(StoreId::Ea, "OFB-EAST:52735", "Zuma's Revenge")
-            .with_extra("content_id", "1002139");
-        assert!(matches_installed_id(&game, "OFB-EAST%3a52735"));
-        assert!(matches_installed_id(
-            &game,
-            "Origin.OFR.50.0000001%2cOFB-EAST%3a52735"
-        ));
-        assert!(matches_installed_id(&game, "1002139"));
-        assert!(!matches_installed_id(&game, "OFB-EAST%3a5273"));
-        assert!(!matches_installed_id(&game, ""));
+    fn reads_installed_manifest_ids() {
+        assert_eq!(manifest_ids("OFB-EAST%3a52735"), vec!["OFB-EAST:52735"]);
+        assert_eq!(
+            manifest_ids("Origin.OFR.50.0000001%2cOFB-EAST%3a52735"),
+            vec!["Origin.OFR.50.0000001", "OFB-EAST:52735"]
+        );
+        assert!(manifest_ids("").is_empty());
     }
 
     #[test]

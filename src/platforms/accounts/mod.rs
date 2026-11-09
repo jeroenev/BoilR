@@ -16,7 +16,8 @@ pub use boilr_stores::{self as stores, StoreId};
 pub use merge::{drop_owned_duplicates, not_installed_collection, NOT_INSTALLED_COLLECTION};
 pub use platform::{AccountPlatform, AccountSettings, InstallWith};
 
-/// Libraries older than this are fetched again when games are listed.
+/// Libraries older than this are fetched again when games are listed
+/// (see [`stores::refresh_if_stale`]).
 pub const LIBRARY_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 
 /// The settings section (and platform code name) of a store account. Never change these.
@@ -57,30 +58,6 @@ where
             .join()
             .map_err(|_| eyre::format_err!("The store request thread stopped unexpectedly"))?
     })
-}
-
-/// Fetches the library of every signed-in store whose cache is older than `max_age_secs`.
-/// Errors are returned per store; a failed store keeps its previous library.
-pub async fn refresh_stale_libraries(
-    stores: &[StoreId],
-    max_age_secs: u64,
-) -> Vec<(StoreId, eyre::Result<usize>)> {
-    let mut results = vec![];
-    for store in stores {
-        let signed_in = matches!(stores::load_session(*store), Ok(Some(_)));
-        if !signed_in {
-            continue;
-        }
-        let library = stores::load_library(*store).ok().flatten();
-        if !stores::is_stale(library.as_ref(), max_age_secs) {
-            continue;
-        }
-        let result = stores::refresh_library(*store)
-            .await
-            .map(|library| library.games.len());
-        results.push((*store, result));
-    }
-    results
 }
 
 #[cfg(test)]

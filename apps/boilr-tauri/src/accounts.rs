@@ -112,7 +112,7 @@ pub fn sign_out_store(store: String) -> Result<StoreAccount, String> {
 #[tauri::command(async)]
 pub fn open_store_sign_in_page(store: String) -> Result<(), String> {
     let store = parse_store(&store)?;
-    let url = match stores::begin_login(store).manual {
+    let url = match stores::pending_login(store).manual {
         stores::ManualLogin::Paste { url, .. } => url,
         stores::ManualLogin::Unsupported => {
             return Err(format!("{} has no manual sign-in", store.display_name()))
@@ -137,11 +137,13 @@ fn open_in_browser(url: &str) -> std::io::Result<()> {
     command.spawn().map(|_| ())
 }
 
-/// Finishes a login with a value the user pasted (an API key, a code or a URL).
+/// Finishes a login with a value the user pasted (an API key, a code or a URL). Uses the
+/// same pending login as the sign-in page the user opened, which Amazon needs (its PKCE
+/// verifier and device serial are part of the sign-in link).
 #[tauri::command]
 pub async fn submit_store_login(store: String, pasted: String) -> Result<StoreAccount, String> {
     let store = parse_store(&store)?;
-    let pending = stores::begin_login(store);
+    let pending = stores::pending_login(store);
     let capture = stores::LoginCapture {
         pasted: Some(pasted.trim().to_string()),
         ..Default::default()
@@ -169,7 +171,7 @@ async fn after_sign_in(store: StoreId) {
 #[tauri::command]
 pub async fn start_store_login(app: AppHandle, store: String) -> Result<(), String> {
     let store = parse_store(&store)?;
-    let pending = stores::begin_login(store);
+    let pending = stores::pending_login(store);
     if pending.done_url_prefixes.is_empty() {
         return Err(format!(
             "{} signs in with a pasted value, not a login window",

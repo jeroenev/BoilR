@@ -65,21 +65,26 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> eyre::Result<Option<T>> {
     }
 }
 
-/// Writes to a temporary file and renames it over the target, so a crash never leaves half a file.
+/// Writes to a temporary file and renames it over the target, so a crash never leaves half a
+/// file. Every write has its own temporary file, so two writers never mix their bytes; the
+/// last rename wins.
 fn write_json<T: Serialize>(path: &Path, value: &T, private: bool) -> eyre::Result<()> {
     let folder = path
         .parent()
         .ok_or_else(|| eyre::format_err!("{} has no parent folder", path.display()))?;
     fs::create_dir_all(folder)?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.{:016x}.tmp", rand::random::<u64>()));
     let bytes = serde_json::to_vec_pretty(value)?;
-    {
+    let written = (|| -> std::io::Result<()> {
         let mut file = open_new(&tmp, private)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(written?)
 }
 
 #[cfg(unix)]
@@ -97,8 +102,7 @@ fn open_new(path: &Path, private: bool) -> std::io::Result<fs::File> {
 fn open_new(path: &Path, _private: bool) -> std::io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(path)
 }
 
@@ -140,6 +144,27 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+
+        // Writers at the same time never mix their bytes.
+        std::thread::scope(|scope| {
+            for count in 0..8 {
+                let library = OwnedLibrary {
+                    fetched_at: count,
+                    games: vec![OwnedGame::new(StoreId::Gog, "1", "Game"); 200],
+                    ..library.clone()
+                };
+                scope.spawn(move || save_library(StoreId::Gog, &library));
+            }
+        });
+        assert_eq!(
+            load_library(StoreId::Gog)?.map(|l| l.games.len()),
+            Some(200)
+        );
+        let leftovers = fs::read_dir(store_folder(StoreId::Gog))?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
 
         delete_account(StoreId::Gog)?;
         assert!(load_session(StoreId::Gog)?.is_none());
