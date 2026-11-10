@@ -254,17 +254,28 @@ pub fn describe_install_target(exe: &str, launch_options: &str) -> String {
         Some("origin2") => "the EA app".to_string(),
         Some("itch") => "the itch app".to_string(),
         Some(_) => "the store's app".to_string(),
-        None => Path::new(exe.trim().trim_matches('"'))
-            .file_stem()
-            .map(|stem| {
-                stem.to_string_lossy()
-                    .trim_end_matches(" Launcher")
-                    .to_string()
-            })
+        None => Some(launcher_name(exe))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "the store's app".to_string()),
     };
     format!("Opens {launcher} to install it")
+}
+
+/// The launcher's name from its path: the file name without extension and " Launcher".
+/// Splits on both `/` and `\`, because `Path` only knows the separator of the system it
+/// runs on, and the path can be a Windows one read on Linux (or the other way round).
+fn launcher_name(exe: &str) -> String {
+    let file_name = exe
+        .trim()
+        .trim_matches('"')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    let stem = match file_name.rsplit_once('.') {
+        Some((stem, _extension)) if !stem.is_empty() => stem,
+        _ => file_name,
+    };
+    stem.trim_end_matches(" Launcher").to_string()
 }
 
 fn browser(launchers: &Launchers, url: &str) -> Target {
@@ -689,6 +700,17 @@ mod tests {
             target(&classic, InstallWith::Auto, &launchers).launch_options,
             "\"https://download.battle.net/\""
         );
+    }
+
+    #[test]
+    fn launcher_names_come_from_windows_and_unix_paths_alike() {
+        assert_eq!(
+            launcher_name(r#""C:\Battle.net\Battle.net Launcher.exe""#),
+            "Battle.net"
+        );
+        assert_eq!(launcher_name("/usr/bin/heroic"), "heroic");
+        assert_eq!(launcher_name("C:/Games/Epic.exe"), "Epic");
+        assert_eq!(launcher_name(""), "");
     }
 
     #[test]
