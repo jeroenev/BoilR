@@ -181,6 +181,7 @@ mod tests {
             shortcut.launch_options,
             "\"origin2://game/launch?offerIds=alice2_dd,1002139\""
         );
+        assert_eq!(shortcut.dev_kit_game_id, "boilr:ea:alice2_dd,1002139");
         assert!(shortcut.tags.contains(&"Installed".to_string()));
     }
 

@@ -145,7 +145,11 @@ Windows:
   - EA `origin2://` with a content id.
   - Battle.net `--game=`.
 - **Matching an installed copy to its owned entry:**
-  - EA: whether one of the `.mfst` ids is the account's offer id or content id.
+  - EA: whether one of the `.mfst` ids is the account's offer id or content id. The current
+    EA app writes no `.mfst`; its installed games are found by the content ids in
+    `__Installer\installerdata.xml`, in the folder Windows lists for them, and open through
+    `origin2://game/launch?offerIds=<content ids>`. Whether those content ids are the ones
+    the account's library reports is not checked yet.
   - itch: whether butler's receipt carries the game id. Older installs without it simply
     don't match.
 - **Heroic on Linux:** used only when it is signed in to the same store. It finds the game
