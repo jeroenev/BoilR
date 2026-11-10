@@ -134,7 +134,7 @@ const GameRow = ({
             </button>
           </p>
         ) : (
-          <p className="truncate text-sm text-mauve">{game.exe}</p>
+          <p className="truncate text-sm text-mauve">{game.opens ?? game.exe}</p>
         )}
       </div>
       <div className="flex shrink-0 items-center gap-3 text-sm">

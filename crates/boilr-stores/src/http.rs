@@ -35,12 +35,34 @@ pub fn domain_matches(cookie_domain: &str, host: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+/// The store refused the saved login: HTTP 401 or 403, or a sign-in page where data was
+/// expected. Store modules check for it with [`is_login_rejected`] to renew the token once
+/// and try again.
+#[derive(Debug)]
+pub struct LoginRejected(pub String);
+
+impl std::fmt::Display for LoginRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LoginRejected {}
+
+pub fn login_rejected(message: impl Into<String>) -> eyre::Report {
+    eyre::Report::new(LoginRejected(message.into()))
+}
+
+pub fn is_login_rejected(err: &eyre::Report) -> bool {
+    err.chain().any(|cause| cause.is::<LoginRejected>())
+}
+
 /// Sends a request and decodes a JSON body, turning HTTP errors into readable messages that
 /// include the start of the response body.
 pub async fn send_json<T: DeserializeOwned>(request: RequestBuilder) -> eyre::Result<T> {
     let response = send(request).await?;
-    let url = response.url().to_string();
-    let text = response.text().await?;
+    let url = without_query(response.url());
+    let text = response.text().await.map_err(request_failed)?;
     serde_json::from_str(&text).map_err(|err| {
         eyre::format_err!(
             "Unexpected response from {url}: {err}. Body starts with: {}",
@@ -51,24 +73,147 @@ pub async fn send_json<T: DeserializeOwned>(request: RequestBuilder) -> eyre::Re
 
 /// Sends a request and fails on a non-success status.
 pub async fn send(request: RequestBuilder) -> eyre::Result<Response> {
-    let response = request.send().await?;
+    let response = request.send().await.map_err(request_failed)?;
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
-    let url = response.url().to_string();
+    let url = without_query(response.url());
     let body = response.text().await.unwrap_or_default();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(eyre::format_err!(
+        return Err(login_rejected(format!(
             "The store rejected the saved login ({status} from {url}). Sign in again. {}",
             snippet(&body)
-        ));
+        )));
     }
     Err(eyre::format_err!("{status} from {url}: {}", snippet(&body)))
 }
 
+/// A reqwest error as a message without the request's query string, which can hold tokens.
+pub fn request_failed(err: reqwest::Error) -> eyre::Report {
+    let at = err.url().map(without_query);
+    let err = err.without_url();
+    let mut message = err.to_string();
+    let mut cause = std::error::Error::source(&err);
+    while let Some(inner) = cause {
+        message.push_str(": ");
+        message.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    match at {
+        Some(url) => eyre::format_err!("{message} ({url})"),
+        None => eyre::format_err!("{message}"),
+    }
+}
+
+/// The URL without query, fragment and user info: what is safe to show in an error.
+pub fn without_query(url: &reqwest::Url) -> String {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    url.to_string()
+}
+
+/// The start of a response body for an error message, with secrets taken out.
 pub fn snippet(text: &str) -> String {
-    text.chars().take(300).collect()
+    redact(text).chars().take(300).collect()
+}
+
+/// Removes what may be a secret from text that ends up in errors and logs: the query string
+/// and fragment of every URL (tokens, client secrets, Humble order keys), and the values of
+/// JSON fields whose names suggest a credential.
+pub fn redact(text: &str) -> String {
+    redact_json_secrets(&redact_urls(text))
+}
+
+fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = ["https://", "http://"]
+        .iter()
+        .filter_map(|scheme| rest.find(scheme))
+        .min()
+    {
+        let (before, from_url) = rest.split_at(start);
+        out.push_str(before);
+        let end = from_url
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '\\')
+            })
+            .unwrap_or(from_url.len());
+        let (url, after) = from_url.split_at(end);
+        let kept = url.find(['?', '#']).unwrap_or(url.len());
+        out.push_str(url.get(..kept).unwrap_or(url));
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+const SECRET_FIELD_PARTS: &[&str] = &[
+    "token", "secret", "password", "cookie", "code", "key", "session", "auth", "ticket", "sid",
+];
+
+fn is_secret_field(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    !name.starts_with("error") && SECRET_FIELD_PARTS.iter().any(|part| name.contains(part))
+}
+
+/// Replaces the string values of secret-looking JSON fields with `"…"`. Works on cut-off or
+/// otherwise broken JSON too.
+fn redact_json_secrets(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        if c != '"' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let name_end = string_end(&chars, i);
+        let name: String = chars
+            .get(i + 1..name_end.saturating_sub(1).max(i + 1))
+            .unwrap_or_default()
+            .iter()
+            .collect();
+        out.extend(chars.get(i..name_end).unwrap_or_default());
+        i = name_end;
+        let colon = skip_whitespace(&chars, i);
+        if chars.get(colon) != Some(&':') || !is_secret_field(&name) {
+            continue;
+        }
+        let value = skip_whitespace(&chars, colon + 1);
+        if chars.get(value) != Some(&'"') {
+            continue;
+        }
+        out.extend(chars.get(i..value).unwrap_or_default());
+        out.push_str("\"…\"");
+        i = string_end(&chars, value);
+    }
+    out
+}
+
+/// The index after the closing quote of the string that opens at `open`.
+fn string_end(chars: &[char], open: usize) -> usize {
+    let mut i = open + 1;
+    while let Some(&c) = chars.get(i) {
+        match c {
+            '\\' => i += 2,
+            '"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    chars.len()
+}
+
+fn skip_whitespace(chars: &[char], mut i: usize) -> usize {
+    while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+        i += 1;
+    }
+    i
 }
 
 /// Reads a query parameter from a URL.
@@ -200,6 +345,34 @@ mod tests {
         assert_eq!(cookie_header(&cookies, "www.humblebundle.com"), "a=1");
         assert_eq!(cookie_header(&cookies, "humblebundle.com"), "a=1");
         assert_eq!(cookie_header(&cookies, "nothumblebundle.com"), "");
+    }
+
+    #[test]
+    fn redacts_secrets_in_urls_and_json() {
+        let message = r#"400 Bad Request from https://auth.gog.com/token?client_id=1&refresh_token=SECRET: {"error":"invalid_grant","refresh_token": "SECRET2","access_token":"SEC\"RET3","count":2}"#;
+        let redacted = redact(message);
+        assert!(!redacted.contains("SECRET"), "{redacted}");
+        assert!(!redacted.contains("RET3"), "{redacted}");
+        assert!(
+            redacted.contains("https://auth.gog.com/token "),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains(r#""error":"invalid_grant""#),
+            "{redacted}"
+        );
+        assert!(redacted.contains(r#""count":2"#), "{redacted}");
+        // Cut-off JSON, as in a snippet.
+        assert_eq!(redact(r#"{"gamekey":"abc"#), r#"{"gamekey":"…""#);
+        assert_eq!(
+            redact("see (https://x.com/a?k=1#f) ok"),
+            "see (https://x.com/a) ok"
+        );
+        let url =
+            reqwest::Url::parse("https://u:p@humblebundle.com/api/v1/order/K?all_tpkds=true#x")
+                .map(|u| without_query(&u))
+                .unwrap_or_default();
+        assert_eq!(url, "https://humblebundle.com/api/v1/order/K");
     }
 
     #[test]

@@ -204,6 +204,20 @@ impl AccountPlatform {
                 _ => "library not fetched yet".to_string(),
             };
             ui.label(format!("Signed in as {who}, {games}."));
+            if status.needs_sign_in {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "The store no longer accepts this sign-in, so the games listed are from \
+                     before. Sign out and sign in again.",
+                );
+            } else if let Some(error) = &status.last_error {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!(
+                        "The last refresh failed, so the games listed are from before: {error}"
+                    ),
+                );
+            }
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!busy, |ui| {
                     if ui.button("Refresh library").clicked() {
@@ -216,13 +230,14 @@ impl AccountPlatform {
                         });
                     }
                     if ui.button("Sign out").clicked() {
-                        let message = match stores::delete_account(store) {
-                            Ok(()) => "Signed out.".to_string(),
-                            Err(err) => format!("Could not sign out: {err}"),
-                        };
-                        let mut panel = lock_panel(&self.panel);
-                        panel.message = Some(message);
-                        panel.status = None;
+                        self.run_in_background(ui.ctx(), move || {
+                            let message = match block_on_fresh(stores::sign_out(store)) {
+                                Ok(Ok(None)) => "Signed out.".to_string(),
+                                Ok(Ok(Some(warning))) => warning,
+                                Ok(Err(err)) | Err(err) => format!("Could not sign out: {err}"),
+                            };
+                            (message, false)
+                        });
                     }
                 });
             });

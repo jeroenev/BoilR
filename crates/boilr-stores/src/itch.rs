@@ -154,8 +154,36 @@ struct ProfileResponse {
 
 #[derive(Deserialize)]
 struct OwnedKeysResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lua_list")]
     owned_keys: Option<Vec<OwnedKey>>,
+}
+
+/// itch.io's API is written in Lua, where an empty list and an empty object are the same
+/// table, so an empty list can arrive as `{}`. Accepts a list, an object of items keyed by
+/// position (`{}` included), or `null`.
+fn lua_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    use serde::de::Error;
+    use serde_json::Value;
+    let items = match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(items)) => items,
+        Some(Value::Object(map)) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_by_key(|(key, _)| key.parse::<u64>().unwrap_or(u64::MAX));
+            entries.into_iter().map(|(_, value)| value).collect()
+        }
+        Some(other) => return Err(D::Error::custom(format!("expected a list, found {other}"))),
+    };
+    items
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<T>, _>>()
+        .map(Some)
+        .map_err(D::Error::custom)
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,7 +208,7 @@ struct Game {
     #[serde(default)]
     classification: Option<String>,
     /// `p_windows`, `p_linux`, `p_osx`, `p_android`, `can_be_bought`, `has_demo`, ...
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lua_list")]
     traits: Option<Vec<String>>,
 }
 
@@ -210,9 +238,9 @@ fn parse_api<T: DeserializeOwned>(text: &str, what: &str) -> eyre::Result<T> {
             .iter()
             .any(|m| m.contains("key") || m.contains("auth") || m.contains("scope"))
         {
-            return Err(eyre::format_err!(
+            return Err(http::login_rejected(format!(
                 "itch.io rejected the API key ({joined}). Create a new key at {API_KEYS_URL} and sign in again."
-            ));
+            )));
         }
         return Err(eyre::format_err!("itch.io returned an error: {joined}"));
     }
@@ -352,6 +380,18 @@ mod tests {
     fn empty_page_ends_paging() -> eyre::Result<()> {
         assert!(parse_owned_keys(OWNED_KEYS_EMPTY)?.is_empty());
         assert!(parse_owned_keys("{\"page\": 3, \"per_page\": 50}")?.is_empty());
+        // Lua sends an empty list as an empty object.
+        assert!(parse_owned_keys("{\"page\": 3, \"owned_keys\": {}}")?.is_empty());
+        let keys = parse_owned_keys(
+            r#"{"owned_keys": {"2": {"game_id": 2, "game": {"id": 2, "title": "B", "traits": {}}},
+                               "1": {"game_id": 1, "game": {"id": 1, "title": "A", "traits": ["p_windows"]}}}}"#,
+        )?;
+        let ids: Vec<Option<u64>> = keys.iter().map(|k| k.game_id).collect();
+        assert_eq!(ids, vec![Some(1), Some(2)]);
+        assert_eq!(
+            keys.last().and_then(|k| k.game.as_ref()).map(platforms),
+            Some(vec![])
+        );
         Ok(())
     }
 

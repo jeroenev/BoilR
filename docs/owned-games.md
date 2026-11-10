@@ -29,7 +29,7 @@ They talk to the same store services.
 | Amazon | Login window, or paste the URL after login. Registers a device, as the Amazon Games app does. | Entitlements service | Amazon Games `amazon-games://install/<id>`, Heroic on Linux, or the Prime Gaming page |
 | EA | Login window only | `getPreloadedOwnedGames` GraphQL. Skips games owned through a linked Steam or Epic account. | EA app `origin2://game/launch/?offerIds=<content id>`, or ea.com |
 | Battle.net | Login window only | `account.battle.net/api/games-and-subs` and classic games | `Battle.net.exe --game=<internal id>`, or the download page |
-| Humble | Login window, or paste the `_simpleauth_sess` cookie | Orders API: DRM-free games with a download | The order's download page |
+| Humble | Login window, or paste the `_simpleauth_sess` cookie | Orders API: DRM-free games with a download. Skips a game when its own order holds a third-party key for it, as Playnite does. | The order's download page |
 | itch.io | Paste an API key | `api.itch.io/profile/owned-keys` | itch app `itch://install?game_id=<id>&launch`, or the game page |
 
 Each store module documents its endpoints and the reference code they come from.
@@ -63,7 +63,22 @@ Each store has a folder at `<config folder>/stores/<store>/`:
 - `session.json` holds tokens or cookies, written with mode 0600 on Unix.
 - `library.json` holds the last owned list.
 
-Sign-out deletes the folder.
+Every change to these files happens under an OS file lock per store
+(`stores/.locks/<store>.lock`), because the classic app, the Tauri app and `boilr --no-ui`
+can run at once. A refresh only saves when the session on disk is still the one it started
+with, so signing out or in again during a refresh wins. A refresh that lists no games while
+the cached library has some keeps the cached one and reports an error.
+
+Sign-out deletes the folder. Amazon and Epic are told first: Amazon removes BoilR from the
+account's devices (as nile does), Epic ends the session (as legendary does). The other
+stores have no way to end a session from outside their apps; the login stays valid until
+it expires.
+
+Errors that leave `boilr-stores` have URL query strings and secret-looking JSON fields
+removed, since tokens travel in URLs (GOG) and bodies. A failed refresh is kept per store for
+the accounts screens; when the store rejected the login, they ask the user to sign in again.
+GOG and Amazon renew the token once and retry when the store rejects one that has not
+expired yet.
 
 ## Not verified yet
 

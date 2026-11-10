@@ -138,22 +138,48 @@ pub async fn fetch_owned(_client: &Client, session: &mut Session) -> eyre::Resul
     }
 
     // Content ids only improve the install link and matching installed copies; without
-    // them the offer id is used, so a failed lookup never fails the library.
+    // them the offer id is used, so a failed lookup never fails the library. Ids the lookup
+    // did not return come from the previous library, so one failed lookup does not unmatch
+    // installed games until the next refresh. (Like EaLibrary, the catalog lookup is sent
+    // without a token.)
     let offer_ids: Vec<String> = games.iter().map(|g| g.id.clone()).collect();
     let mut content_ids = HashMap::new();
     for batch in offer_ids.chunks(LEGACY_OFFER_BATCH) {
         match legacy_content_ids(&client, batch).await {
             Ok(found) => content_ids.extend(found),
-            Err(err) => eprintln!("Could not look up EA content ids, using offer ids: {err:?}"),
+            Err(err) => eprintln!(
+                "Could not look up EA content ids, using the ones from before: {}",
+                http::redact(&format!("{err:#}"))
+            ),
         }
     }
-    Ok(games
+    let previous = crate::cached_library(StoreId::Ea)
+        .map(|l| l.games)
+        .unwrap_or_default();
+    Ok(with_content_ids(games, &content_ids, &previous))
+}
+
+fn with_content_ids(
+    games: Vec<OwnedGame>,
+    content_ids: &HashMap<String, String>,
+    previous: &[OwnedGame],
+) -> Vec<OwnedGame> {
+    games
         .into_iter()
-        .map(|game| match content_ids.get(&game.id) {
-            Some(content_id) => game.with_extra("content_id", content_id.clone()),
-            None => game,
+        .map(|game| {
+            let content_id = content_ids.get(&game.id).cloned().or_else(|| {
+                previous
+                    .iter()
+                    .find(|p| p.id == game.id)
+                    .and_then(|p| p.extra("content_id"))
+                    .map(str::to_string)
+            });
+            match content_id {
+                Some(content_id) => game.with_extra("content_id", content_id),
+                None => game,
+            }
         })
-        .collect())
+        .collect()
 }
 
 /// The ids in the `id=` value of an installed EA game's `.mfst` manifest (in
@@ -667,6 +693,25 @@ mod tests {
             Some("1028663")
         );
         Ok(())
+    }
+
+    #[test]
+    fn content_ids_fall_back_to_the_previous_library() {
+        let games = vec![
+            OwnedGame::new(StoreId::Ea, "A", "A"),
+            OwnedGame::new(StoreId::Ea, "B", "B"),
+            OwnedGame::new(StoreId::Ea, "C", "C"),
+        ];
+        let found = HashMap::from([("A".to_string(), "1".to_string())]);
+        let previous = vec![
+            OwnedGame::new(StoreId::Ea, "A", "A").with_extra("content_id", "old"),
+            OwnedGame::new(StoreId::Ea, "B", "B").with_extra("content_id", "2"),
+        ];
+        let ids: Vec<Option<String>> = with_content_ids(games, &found, &previous)
+            .iter()
+            .map(|g| g.extra("content_id").map(str::to_string))
+            .collect();
+        assert_eq!(ids, vec![Some("1".into()), Some("2".into()), None]);
     }
 
     #[test]

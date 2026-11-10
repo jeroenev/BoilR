@@ -52,7 +52,8 @@ pub fn get_boilr_links_path() -> PathBuf {
     get_config_folder().join("links")
 }
 
-#[cfg(test)]
+// The tests only run on Unix: the config folder on Windows comes from %APPDATA%.
+#[cfg(all(test, target_family = "unix"))]
 mod tests {
     use std::path::PathBuf;
 

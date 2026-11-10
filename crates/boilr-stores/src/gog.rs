@@ -14,6 +14,7 @@
 //! [`OwnedGame::extra`] keys:
 //! - `slug`: the store slug (`https://www.gog.com/game/<slug>`), when GOG sends one.
 
+use eyre::WrapErr;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -163,14 +164,28 @@ pub async fn complete_login(
 
 pub async fn fetch_owned(client: &Client, session: &mut Session) -> eyre::Result<Vec<OwnedGame>> {
     let mut gog = read_session(session)?;
+    let mut renewed = false;
     if needs_refresh(&gog, now_unix()) {
         gog = refresh(client, &gog).await?;
         session.data = serde_json::to_value(&gog)?;
+        renewed = true;
     }
     if session.account_name.is_none() {
         session.account_name = fetch_username(client, &gog).await.ok().flatten();
     }
+    let games = match fetch_products(client, &gog).await {
+        // GOG can end a token before it expires: renew it once and try again.
+        Err(err) if !renewed && http::is_login_rejected(&err) => {
+            gog = refresh(client, &gog).await?;
+            session.data = serde_json::to_value(&gog)?;
+            fetch_products(client, &gog).await
+        }
+        result => result,
+    };
+    games.wrap_err("Could not load the GOG library")
+}
 
+async fn fetch_products(client: &Client, gog: &GogSession) -> eyre::Result<Vec<OwnedGame>> {
     let mut games = Vec::new();
     let mut page = 1;
     loop {
@@ -180,10 +195,10 @@ pub async fn fetch_owned(client: &Client, session: &mut Session) -> eyre::Result
                 .bearer_auth(&gog.access_token)
                 .query(&[("mediaType", "1"), ("page", &page.to_string())]),
         )
-        .await
-        .map_err(|err| eyre::format_err!("Could not load the GOG library: {err}"))?
+        .await?
         .text()
-        .await?;
+        .await
+        .map_err(http::request_failed)?;
         let response = parse_products_page(&body)?;
         games.extend(games_from_page(&response));
         match next_page(&response, page) {
@@ -208,7 +223,9 @@ async fn refresh(client: &Client, gog: &GogSession) -> eyre::Result<GogSession> 
         ("refresh_token", gog.refresh_token.as_str()),
     ]))
     .await
-    .map_err(|err| eyre::format_err!("The GOG login has expired; sign in again. ({err})"))?;
+    .map_err(|err| {
+        http::login_rejected(format!("The GOG login has expired; sign in again. ({err})"))
+    })?;
     Ok(session_from_token(token, now_unix()))
 }
 
@@ -289,8 +306,8 @@ fn code_from_capture(capture: &LoginCapture) -> eyre::Result<String> {
 /// Without a valid token GOG redirects the library request to its sign-in web page.
 fn parse_products_page(body: &str) -> eyre::Result<ProductsPage> {
     if body.trim_start().starts_with('<') {
-        return Err(eyre::format_err!(
-            "GOG did not accept the saved login (it sent a web page instead of the library). Sign in again."
+        return Err(http::login_rejected(
+            "GOG did not accept the saved login (it sent a web page instead of the library). Sign in again.",
         ));
     }
     serde_json::from_str(body).map_err(|err| {

@@ -15,6 +15,7 @@ mod targets;
 pub use boilr_stores::{self as stores, StoreId};
 pub use merge::{drop_owned_duplicates, not_installed_collection, NOT_INSTALLED_COLLECTION};
 pub use platform::{AccountPlatform, AccountSettings, InstallWith};
+pub use targets::describe_install_target;
 
 /// Libraries older than this are fetched again when games are listed
 /// (see [`stores::refresh_if_stale`]).

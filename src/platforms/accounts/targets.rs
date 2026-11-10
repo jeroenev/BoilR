@@ -93,9 +93,21 @@ pub(crate) fn owned_shortcut(
     let identity = owned_identity(game);
     shortcut.app_id = crate::sync::owned_app_id(&shortcut.exe, &shortcut.app_name, &identity);
     shortcut.dev_kit_game_id = format!("{}{identity}", crate::sync::IDENTITY_PREFIX);
-    shortcut.tags.push(game.store.display_name().to_owned());
+    shortcut.tags.push(store_tag(game.store).to_owned());
     shortcut.tags.push("Not installed".to_owned());
     shortcut
+}
+
+/// The tag the store's installed-games platform gives its games, so a game keeps its tag
+/// when it is installed or uninstalled.
+fn store_tag(store: StoreId) -> &'static str {
+    match store {
+        StoreId::Epic => "EGS",
+        StoreId::Gog => "Gog",
+        StoreId::Itch => "Itch",
+        StoreId::Ea => "Origin/EA Desktop",
+        StoreId::Amazon | StoreId::BattleNet | StoreId::Humble => store.display_name(),
+    }
 }
 
 /// `<store>:<id>`, plus the other ids an installed copy may report instead (an EA game's
@@ -217,6 +229,37 @@ fn heroic_target(game: &OwnedGame, launchers: &Launchers) -> Option<Target> {
             launch_options: link,
         }),
     }
+}
+
+/// What the shortcut of a game that is not installed does, for display ("Opens GOG Galaxy
+/// to install it"), from the shortcut's target as [`target`] writes it.
+pub fn describe_install_target(exe: &str, launch_options: &str) -> String {
+    let link = launch_options.trim().trim_matches('"');
+    if launch_options.contains("heroic://") {
+        return "Opens Heroic to install it".to_string();
+    }
+    if let Some(rest) = link.strip_prefix("https://") {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        return format!("Opens its store page on {host}");
+    }
+    let launcher = match link.split_once("://").map(|(scheme, _)| scheme) {
+        Some("com.epicgames.launcher") => "the Epic Games Launcher".to_string(),
+        Some("goggalaxy") => "GOG Galaxy".to_string(),
+        Some("amazon-games") => "Amazon Games".to_string(),
+        Some("origin2") => "the EA app".to_string(),
+        Some("itch") => "the itch app".to_string(),
+        Some(_) => "the store's app".to_string(),
+        None => Path::new(exe.trim().trim_matches('"'))
+            .file_stem()
+            .map(|stem| {
+                stem.to_string_lossy()
+                    .trim_end_matches(" Launcher")
+                    .to_string()
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "the store's app".to_string()),
+    };
+    format!("Opens {launcher} to install it")
 }
 
 fn browser(launchers: &Launchers, url: &str) -> Target {
@@ -581,10 +624,52 @@ mod tests {
     }
 
     #[test]
+    fn describes_what_the_shortcut_does() {
+        let launchers = Launchers {
+            epic: Some(PathBuf::from("C:\\Epic\\EpicGamesLauncher.exe")),
+            galaxy: Some(PathBuf::from("C:\\GOG Galaxy\\GalaxyClient.exe")),
+            battlenet: Some(PathBuf::from("C:\\Battle.net\\Battle.net Launcher.exe")),
+            ..windows()
+        };
+        let describe = |game: &OwnedGame, launchers: &Launchers| {
+            let target = target(game, InstallWith::Auto, launchers);
+            describe_install_target(&target.exe, &target.launch_options)
+        };
+        assert_eq!(
+            describe(&game(StoreId::Epic, "Fortnite"), &launchers),
+            "Opens the Epic Games Launcher to install it"
+        );
+        assert_eq!(
+            describe(&game(StoreId::Gog, "1"), &launchers),
+            "Opens GOG Galaxy to install it"
+        );
+        assert_eq!(
+            describe(
+                &game(StoreId::BattleNet, "Pro").with_extra("internal_id", "prometheus"),
+                &launchers
+            ),
+            "Opens Battle.net to install it"
+        );
+        assert_eq!(
+            describe(&game(StoreId::Itch, "42"), &linux()),
+            "Opens its store page on itch.io"
+        );
+        let heroic = Launchers {
+            heroic: Some(Heroic::Flatpak),
+            heroic_stores: vec![StoreId::Gog],
+            ..linux()
+        };
+        assert_eq!(
+            describe(&game(StoreId::Gog, "1"), &heroic),
+            "Opens Heroic to install it"
+        );
+    }
+
+    #[test]
     fn shortcut_carries_identity_and_tags() {
         let shortcut = owned_shortcut(&game(StoreId::Itch, "42"), InstallWith::Auto, &linux());
         assert_eq!(shortcut.dev_kit_game_id, "boilr:itch:42");
-        assert!(shortcut.tags.contains(&"Not installed".to_string()));
+        assert_eq!(shortcut.tags, vec!["Itch", "Not installed"]);
         assert_eq!(shortcut.app_name, "Some Game");
     }
 }

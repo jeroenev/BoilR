@@ -219,8 +219,42 @@ pub async fn fetch_owned(_client: &Client, session: &mut Session) -> eyre::Resul
         session.account_name = Some(tag);
     }
     let games: GamesAndSubs = api_get(&client, &jar, GAMES_URL).await?;
-    let classic: ClassicGames = api_get(&client, &jar, CLASSIC_GAMES_URL).await?;
-    Ok(owned_games(&games, &classic))
+    // The classic CD-key games are a small extra: when only their list fails, the ones from
+    // the previous library are kept instead of failing the whole library.
+    let classic = match api_get::<ClassicGames>(&client, &jar, CLASSIC_GAMES_URL).await {
+        Ok(classic) => Some(classic),
+        Err(err) if http::is_login_rejected(&err) => return Err(err),
+        Err(err) => {
+            eprintln!(
+                "Could not list the Battle.net classic games, keeping the ones from before: {}",
+                http::redact(&format!("{err:#}"))
+            );
+            None
+        }
+    };
+    let owned = owned_games(&games, classic.as_ref().unwrap_or(&ClassicGames::default()));
+    Ok(match classic {
+        Some(_) => owned,
+        None => with_previous_classic_games(
+            owned,
+            &crate::cached_library(StoreId::BattleNet)
+                .map(|l| l.games)
+                .unwrap_or_default(),
+        ),
+    })
+}
+
+fn with_previous_classic_games(
+    mut owned: Vec<OwnedGame>,
+    previous: &[OwnedGame],
+) -> Vec<OwnedGame> {
+    for game in previous {
+        let classic = product(&game.id).is_some_and(|p| !p.launcher);
+        if classic && !owned.iter().any(|o| o.id == game.id) {
+            owned.push(game.clone());
+        }
+    }
+    owned
 }
 
 /// Replays the account site's OAuth sign-in with the saved cookies, which gives the client a
@@ -441,6 +475,21 @@ mod tests {
         assert_eq!(war3.extra("launcher"), Some("false"));
         assert_eq!(war3.extra("internal_id"), None);
         assert_eq!(war3.extra("title_id"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_classic_list_keeps_the_classic_games_from_before() -> eyre::Result<()> {
+        let games: GamesAndSubs = fixture("games_and_subs.json")?;
+        let classic: ClassicGames = fixture("classic_games.json")?;
+        let before = owned_games(&games, &classic);
+        let now =
+            with_previous_classic_games(owned_games(&games, &ClassicGames::default()), &before);
+        let codes: Vec<&str> = now.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(
+            codes,
+            vec!["WoW", "Pro", "WTCG", "Fen", "W3C", "W3CX", "D2"]
+        );
         Ok(())
     }
 

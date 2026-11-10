@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import clsx from "clsx";
 
-import type { InstallWith, StoreAccount, StoreLoginEvent } from "../types";
+import type { InstallWith, LoginResult, StoreAccount } from "../types";
 import { errorMessage } from "../lib/format";
 import { SettingRow, Toggle } from "./controls";
 
@@ -92,6 +91,16 @@ const AccountCard = ({
           <p className="text-mauve">Not signed in</p>
         )}
       </div>
+      {account.signed_in && account.needs_sign_in ? (
+        <p role="alert" className="mt-2 max-w-prose text-ember">
+          {account.name} no longer accepts this sign-in, so the games listed are from before. Sign out and sign in
+          again.
+        </p>
+      ) : account.signed_in && account.last_error ? (
+        <p role="alert" className="mt-2 max-w-prose text-ember">
+          The last refresh failed, so the games listed are from before: {account.last_error}
+        </p>
+      ) : null}
 
       {account.signed_in ? (
         <>
@@ -169,11 +178,11 @@ const AccountCard = ({
           </div>
           {showManual && account.manual.kind === "paste" ? (
             <div className="mt-3 max-w-prose">
-              <p className="text-mauve">
+              <p className="text-mauve">{account.manual.instructions}</p>
+              <p className="mt-1">
                 <button type="button" className="link-btn" onClick={openSignInPage}>
-                  Open the sign-in page
-                </button>{" "}
-                {account.manual.instructions}
+                  Open the sign-in page in your browser
+                </button>
               </p>
               <div className="mt-2 flex flex-wrap gap-2">
                 <input
@@ -202,7 +211,16 @@ const AccountCard = ({
   );
 };
 
-export const AccountsView = ({ onAccountsChanged }: { onAccountsChanged: () => void }) => {
+export const AccountsView = ({
+  onAccountsChanged,
+  loginResult,
+  onLoginResultSeen,
+}: {
+  onAccountsChanged: () => void;
+  /** The last login window result, caught by App so none is missed while this view is closed. */
+  loginResult: LoginResult | null;
+  onLoginResultSeen: () => void;
+}) => {
   const [accounts, setAccounts] = useState<StoreAccount[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -212,6 +230,7 @@ export const AccountsView = ({ onAccountsChanged }: { onAccountsChanged: () => v
   const load = useCallback(async () => {
     try {
       setAccounts(await invoke<StoreAccount[]>("list_store_accounts"));
+      setError(null);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -223,34 +242,24 @@ export const AccountsView = ({ onAccountsChanged }: { onAccountsChanged: () => v
     void load();
   }, [load]);
 
+  // App refreshes the games itself; this view shows the result and reloads the accounts.
   useEffect(() => {
-    let active = true;
-    let unlisten: (() => void) | null = null;
-    listen<StoreLoginEvent>("store-login", (event) => {
-      if (!active) return;
-      setBusy((prev) => {
-        const next = new Set(prev);
-        next.delete(event.payload.store);
-        return next;
-      });
-      if (event.payload.ok) {
-        setNotice(event.payload.message);
-        setError(null);
-        onAccountsChanged();
-      } else {
-        setError(event.payload.message);
-      }
-      void load();
-    })
-      .then((stop) => {
-        unlisten = stop;
-      })
-      .catch((err) => console.error("Failed to listen for store logins", err));
-    return () => {
-      active = false;
-      unlisten?.();
-    };
-  }, [load, onAccountsChanged]);
+    if (!loginResult) return;
+    setBusy((prev) => {
+      const next = new Set(prev);
+      next.delete(loginResult.store);
+      return next;
+    });
+    if (loginResult.ok) {
+      setNotice(loginResult.message);
+      setError(null);
+    } else {
+      setNotice(null);
+      setError(loginResult.message);
+    }
+    void load();
+    onLoginResultSeen();
+  }, [loginResult, load, onLoginResultSeen]);
 
   const setStoreBusy = (key: string, value: boolean) =>
     setBusy((prev) => {
@@ -285,7 +294,9 @@ export const AccountsView = ({ onAccountsChanged }: { onAccountsChanged: () => v
               onBusy={(value) => setStoreBusy(account.key, value)}
               onChanged={(updated, message) => {
                 setAccounts((prev) => prev.map((a) => (a.key === updated.key ? updated : a)));
-                if (message) setNotice(message);
+                setError(null);
+                if (updated.notice) setNotice(`${message ? `${message}. ` : ""}${updated.notice}`);
+                else if (message) setNotice(message);
                 onAccountsChanged();
               }}
             />

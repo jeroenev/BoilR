@@ -193,7 +193,6 @@ pub fn sync_shortcuts_with_collections(
             recompute_app_id(shortcut, owned);
             previous_ids.insert(shortcut.app_id, original_id);
         }
-        println!("Appid: {} name: {}", shortcut.app_id, shortcut.app_name);
     }
     let mut collections: Vec<(String, Vec<u32>)> = platform_shortcuts
         .iter()
@@ -220,6 +219,9 @@ pub fn sync_shortcuts_with_collections(
 
         let mut user_shortcuts = all_shortcuts.clone();
         keep_identity_app_ids(&shortcut_info.shortcuts, &mut user_shortcuts);
+        for shortcut in &user_shortcuts {
+            println!("Appid: {} name: {}", shortcut.app_id, shortcut.app_name);
+        }
         keep_steam_fields(&shortcut_info.shortcuts, &mut user_shortcuts, &previous_ids);
 
         remove_old_shortcuts(&mut shortcut_info);
@@ -243,7 +245,11 @@ pub fn sync_shortcuts_with_collections(
 
         if settings.steam.create_collections {
             let user_collections = map_collection_ids(&collections, &final_ids);
-            match write_shortcut_collections(&user.user_id, &user_collections) {
+            match write_shortcut_collections(
+                &user.user_id,
+                Path::new(&user.steam_user_data_folder),
+                &user_collections,
+            ) {
                 Ok(_) => (),
                 Err(_e) => eprintln!("Could not write collections, make sure steam is shut down"),
             }
@@ -438,6 +444,7 @@ fn fix_shortcut_icons(
 
 fn write_shortcut_collections<S: AsRef<str>>(
     steam_id: S,
+    user_data_folder: &Path,
     platform_results: &[(String, Vec<u32>)],
 ) -> Result<(), Box<dyn Error>> {
     let mut collections = vec![];
@@ -453,7 +460,7 @@ fn write_shortcut_collections<S: AsRef<str>>(
         });
     }
     println!("Writing {} collections ", collections.len());
-    write_collections(steam_id.as_ref(), &collections)?;
+    write_collections(steam_id.as_ref(), user_data_folder, &collections)?;
     Ok(())
 }
 

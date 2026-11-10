@@ -26,6 +26,7 @@ const SIGN_IN_URL: &str = "https://www.amazon.com/ap/signin";
 const RETURN_TO: &str = "https://www.amazon.com";
 const REGISTER_URL: &str = "https://api.amazon.com/auth/register";
 const TOKEN_URL: &str = "https://api.amazon.com/auth/token";
+const DEREGISTER_URL: &str = "https://api.amazon.com/auth/deregister";
 const ENTITLEMENTS_URL: &str = "https://gaming.amazon.com/api/distribution/entitlements";
 const ENTITLEMENTS_TARGET: &str =
     "com.amazon.animusdistributionservice.entitlement.AnimusEntitlementsService.GetEntitlements";
@@ -128,11 +129,27 @@ pub async fn fetch_owned(client: &Client, session: &mut Session) -> eyre::Result
         serde_json::from_value(session.data.clone()).map_err(|err| {
             eyre::format_err!("The saved Amazon login can't be read ({err}). Sign in again.")
         })?;
+    let mut renewed = false;
     if amazon.needs_refresh(crate::now_unix()) {
         refresh(client, &mut amazon).await?;
         session.data = serde_json::to_value(&amazon)?;
+        renewed = true;
     }
+    match fetch_entitlements(client, &amazon).await {
+        // Amazon can end a token before it expires: renew it once and try again.
+        Err(err) if !renewed && http::is_login_rejected(&err) => {
+            refresh(client, &mut amazon).await?;
+            session.data = serde_json::to_value(&amazon)?;
+            fetch_entitlements(client, &amazon).await
+        }
+        result => result,
+    }
+}
 
+async fn fetch_entitlements(
+    client: &Client,
+    amazon: &AmazonSession,
+) -> eyre::Result<Vec<OwnedGame>> {
     let hardware_hash = hardware_hash(&amazon.device_serial);
     let mut entitlements = vec![];
     let mut next_token: Option<String> = None;
@@ -160,6 +177,25 @@ pub async fn fetch_owned(client: &Client, session: &mut Session) -> eyre::Result
     Err(eyre::format_err!(
         "Amazon kept sending more pages of games after {MAX_PAGES} pages; giving up."
     ))
+}
+
+/// Removes BoilR from the account's registered devices, as nile does when it logs out.
+pub async fn sign_out(client: &Client, session: &Session) -> eyre::Result<()> {
+    let mut amazon: AmazonSession = serde_json::from_value(session.data.clone())?;
+    if amazon.needs_refresh(crate::now_unix()) {
+        refresh(client, &mut amazon).await?;
+    }
+    http::send(
+        client
+            .post(DEREGISTER_URL)
+            .header(header::USER_AGENT, AUTH_USER_AGENT)
+            .bearer_auth(&amazon.access_token)
+            .json(&serde_json::json!({
+                "request_metadata": { "app_name": APP_NAME, "app_version": APP_VERSION }
+            })),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn refresh(client: &Client, session: &mut AmazonSession) -> eyre::Result<()> {
@@ -534,13 +570,13 @@ fn apply_refresh(
             session.expires_at = expires_at(response.expires_in.as_ref(), now);
             Ok(())
         }
-        None => Err(eyre::format_err!(
+        None => Err(http::login_rejected(format!(
             "Amazon did not refresh the login ({}). Sign in again.",
             response
                 .error_description
                 .or(response.error)
                 .unwrap_or_else(|| "no access token in the response".into())
-        )),
+        ))),
     }
 }
 

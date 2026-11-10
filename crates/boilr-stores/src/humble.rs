@@ -17,7 +17,7 @@
 //! - `url`: the page where the user downloads it (`/downloads?key=<gamekey>`).
 //! - `platforms`: comma-separated download platforms (`windows`, `linux`, `mac`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use reqwest::{header::HeaderMap, Client};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -26,8 +26,9 @@ use crate::{http, Cookie, LoginCapture, ManualLogin, OwnedGame, PendingLogin, Se
 
 const LOGIN_URL: &str = "https://www.humblebundle.com/login?goto=%2Fhome%2Flibrary";
 const LIBRARY_URL: &str = "https://www.humblebundle.com/home/library";
-/// After signing in, Humble sends the browser to `goto`, the library page.
-const DONE_URL_PREFIX: &str = "https://www.humblebundle.com/home";
+/// After signing in, Humble sends the browser to `goto`, the library page. Only that page
+/// ends the login, not any `/home` page the user might reach on the way.
+const DONE_URL_PREFIX: &str = "https://www.humblebundle.com/home/library";
 const COOKIE_URL: &str = "https://www.humblebundle.com/";
 const COOKIE_HOST: &str = "www.humblebundle.com";
 const ORDER_LIST_URL: &str = "https://www.humblebundle.com/api/v1/user/order";
@@ -318,25 +319,23 @@ fn parse_orders(text: &str) -> eyre::Result<Vec<Order>> {
 }
 
 /// The games in the orders, following Playnite's `GetLibraryGames` with its default settings.
+///
+/// A title in several orders is listed once. Its id is the smallest `machine_name` among
+/// them, not the one from whichever order comes first, so buying a game again in another
+/// bundle does not give it a new id (which would make a new Steam shortcut).
 fn owned_games(orders: &[Order]) -> Vec<OwnedGame> {
-    let third_party_keys: Vec<String> = orders
-        .iter()
-        .filter_map(|o| o.tpkd_dict.as_ref())
-        .flat_map(|t| &t.all_tpks)
-        .filter_map(|t| t.human_name.as_deref())
-        .filter(|n| !n.is_empty())
-        .map(str::to_lowercase)
-        .collect();
-    let mut seen_names = BTreeSet::new();
-    let mut games = Vec::new();
+    let mut by_title: BTreeMap<&str, OwnedGame> = BTreeMap::new();
     for order in orders {
-        let order_has_keys = order
-            .tpkd_dict
-            .as_ref()
-            .is_some_and(|t| !t.all_tpks.is_empty());
         let Some(gamekey) = order.gamekey.as_deref().filter(|k| !k.is_empty()) else {
             continue;
         };
+        // Like Playnite, only the keys of the same order hide a DRM-free game.
+        let key_names: Vec<&str> = order
+            .tpkd_dict
+            .iter()
+            .flat_map(|t| &t.all_tpks)
+            .filter_map(|t| t.human_name.as_deref())
+            .collect();
         for product in &order.subproducts {
             let (Some(machine_name), Some(human_name)) = (
                 product.machine_name.as_deref(),
@@ -344,7 +343,7 @@ fn owned_games(orders: &[Order]) -> Vec<OwnedGame> {
             ) else {
                 continue;
             };
-            if machine_name.is_empty() || seen_names.contains(human_name) {
+            if machine_name.is_empty() {
                 continue;
             }
             let platforms: BTreeSet<&str> = product
@@ -353,18 +352,18 @@ fn owned_games(orders: &[Order]) -> Vec<OwnedGame> {
                 .filter_map(|d| d.platform.as_deref())
                 .filter(|p| GAME_PLATFORMS.contains(p))
                 .collect();
-            if platforms.is_empty() {
+            if platforms.is_empty() || key_names.iter().any(|k| is_key_for(k, human_name)) {
                 continue;
             }
-            // Playnite's four name patterns all come down to: a key's name contains the
-            // game's name ("Game", "Game Steam Key", "Game (Steam)").
-            let lower_name = human_name.to_lowercase();
-            if order_has_keys && third_party_keys.iter().any(|k| k.contains(&lower_name)) {
+            if by_title
+                .get(human_name)
+                .is_some_and(|listed| listed.id.as_str() <= machine_name)
+            {
                 continue;
             }
-            seen_names.insert(human_name);
             let platforms: Vec<&str> = platforms.into_iter().collect();
-            games.push(
+            by_title.insert(
+                human_name,
                 OwnedGame::new(StoreId::Humble, machine_name, clean_title(human_name))
                     .with_extra("gamekey", gamekey)
                     .with_extra(
@@ -375,7 +374,60 @@ fn owned_games(orders: &[Order]) -> Vec<OwnedGame> {
             );
         }
     }
-    games
+    by_title.into_values().collect()
+}
+
+/// Words that may follow a game's name in the name of its third-party key.
+const KEY_NAME_WORDS: &[&str] = &[
+    "key",
+    "keys",
+    "steam",
+    "epic",
+    "games",
+    "store",
+    "gog",
+    "origin",
+    "ea",
+    "app",
+    "uplay",
+    "ubisoft",
+    "connect",
+    "battle",
+    "net",
+    "rockstar",
+    "launcher",
+    "microsoft",
+    "xbox",
+    "pc",
+    "drm",
+    "free",
+];
+
+/// Whether a third-party key's name is for the game `title`: the same name, or the name
+/// followed only by a store or "key" ("FEZ Steam Key", "FEZ (Steam)", "FEZ - Epic Games
+/// Key"), the patterns of Playnite's HumbleLibrary. A key for another game whose name merely
+/// contains the title ("FEZ II Steam Key", "Limbonauts") does not count.
+fn is_key_for(key_name: &str, title: &str) -> bool {
+    let normalize = |name: &str| {
+        clean_title(name)
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (key_name, title) = (normalize(key_name), normalize(title));
+    if title.is_empty() {
+        return false;
+    }
+    let Some(rest) = key_name.strip_prefix(&title) else {
+        return false;
+    };
+    if rest.starts_with(char::is_alphanumeric) {
+        return false;
+    }
+    rest.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .all(|word| KEY_NAME_WORDS.contains(&word))
 }
 
 /// Removes trademark signs, as Playnite's `RemoveTrademarks` does.
@@ -454,13 +506,13 @@ mod tests {
     #[test]
     fn lists_drm_free_games_and_skips_keys_and_non_games() -> eyre::Result<()> {
         let games = owned_games(&parse_orders(ORDERS)?);
-        // BTreeMap order of the fixture's order keys: aAbBcC123, dDeEfF456, gGhHiI789.
+        // Sorted by title: Another Game, FEZ, World of Goo.
         assert_eq!(
             ids(&games),
-            vec!["fez_indiebundle", "worldofgoo_linux", "anothergame_store"]
+            vec!["anothergame_store", "fez_indiebundle", "worldofgoo_linux"]
         );
 
-        let fez = games.first();
+        let fez = games.get(1);
         assert_eq!(fez.map(|g| g.title.as_str()), Some("FEZ"));
         assert_eq!(fez.and_then(|g| g.extra("gamekey")), Some("aAbBcC123"));
         assert_eq!(
@@ -473,7 +525,7 @@ mod tests {
         );
 
         // A Linux-only game counts too (Playnite only takes Windows).
-        let goo = games.get(1);
+        let goo = games.get(2);
         assert_eq!(goo.and_then(|g| g.extra("platforms")), Some("linux"));
         Ok(())
     }
@@ -483,6 +535,71 @@ mod tests {
         let games = owned_games(&parse_orders(ORDERS)?);
         assert_eq!(games.iter().filter(|g| g.title == "FEZ").count(), 1);
         Ok(())
+    }
+
+    fn order(gamekey: &str, games: &[(&str, &str)], keys: &[&str]) -> Order {
+        Order {
+            gamekey: Some(gamekey.into()),
+            subproducts: games
+                .iter()
+                .map(|(machine_name, human_name)| SubProduct {
+                    machine_name: Some((*machine_name).into()),
+                    human_name: Some((*human_name).into()),
+                    downloads: vec![Download {
+                        platform: Some("windows".into()),
+                    }],
+                })
+                .collect(),
+            tpkd_dict: Some(TpkdDict {
+                all_tpks: keys
+                    .iter()
+                    .map(|name| Tpk {
+                        human_name: Some((*name).into()),
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    #[test]
+    fn keys_only_hide_their_own_game_in_their_own_order() {
+        let orders = [
+            order("b", &[("limbo", "Limbo"), ("fez", "FEZ")], &[]),
+            order(
+                "a",
+                &[("other", "Other")],
+                &["Limbo Steam Key", "FEZ II Steam Key"],
+            ),
+            order(
+                "c",
+                &[("hue", "Hue"), ("braid", "Braid")],
+                &["Huey Steam Key", "Braid (Steam)"],
+            ),
+        ];
+        let games = owned_games(&orders);
+        assert_eq!(ids(&games), vec!["fez", "hue", "limbo", "other"]);
+    }
+
+    #[test]
+    fn a_new_order_does_not_change_a_games_id() {
+        let first = owned_games(&[order("m", &[("game_b", "Game")], &[])]);
+        let both = owned_games(&[
+            order("a", &[("game_c", "Game")], &[]),
+            order("m", &[("game_b", "Game")], &[]),
+        ]);
+        assert_eq!(ids(&first), ids(&both));
+    }
+
+    #[test]
+    fn matches_key_names_like_playnite() {
+        assert!(is_key_for("FEZ", "FEZ"));
+        assert!(is_key_for("FEZ Steam Key", "FEZ"));
+        assert!(is_key_for("Fez (Steam)", "FEZ"));
+        assert!(is_key_for("FEZ™ - Epic Games Key", "FEZ"));
+        assert!(!is_key_for("FEZ II Steam Key", "FEZ"));
+        assert!(!is_key_for("Limbonauts Steam Key", "Limbo"));
+        assert!(!is_key_for("Chuchel Steam Key", "Hue"));
+        assert!(!is_key_for("Anything", ""));
     }
 
     #[test]

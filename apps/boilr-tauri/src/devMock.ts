@@ -20,7 +20,11 @@ const game = (name: string, exe = `/games/${name}`): ShortcutSummary => ({
   installed: true,
 });
 
-const owned = (name: string): ShortcutSummary => ({ ...game(name, "xdg-open"), installed: false });
+const owned = (name: string): ShortcutSummary => ({
+  ...game(name, "xdg-open"),
+  installed: false,
+  opens: "Opens its store page on www.gog.com",
+});
 
 let settings: Settings = {
   steam: { stop_steam: false, start_steam: false, create_collections: false, optimize_for_big_picture: false, location: null },
@@ -53,10 +57,12 @@ const account = (key: string, name: string, extra: Partial<StoreAccount> = {}): 
   manual: {
     kind: "paste",
     url: `https://example.com/${key}/login`,
-    instructions: "then paste the address your browser ends on.",
+    instructions: "Sign in in your browser, then paste the address your browser ends on.",
     placeholder: "https://…",
   },
   webview_login: true,
+  last_error: null,
+  needs_sign_in: false,
   code_name: `${key}_account`,
   enabled: false,
   install_with: "auto",
@@ -69,10 +75,17 @@ let accounts: StoreAccount[] = [
   account("amazon", "Amazon Games"),
   account("ea", "EA app", { manual: { kind: "unsupported" } }),
   account("battlenet", "Battle.net", { manual: { kind: "unsupported" } }),
-  account("humble", "Humble Bundle"),
+  account("humble", "Humble Bundle", {
+    signed_in: true,
+    game_count: 12,
+    fetched_at: Math.floor(Date.now() / 1000) - 3 * 86400,
+    enabled: true,
+    needs_sign_in: true,
+    last_error: "Humble Bundle did not accept the saved login. Sign in again.",
+  }),
   account("itch", "itch.io", {
     webview_login: false,
-    manual: { kind: "paste", url: "https://itch.io/user/settings/api-keys", instructions: "create an API key and paste it here.", placeholder: "API key" },
+    manual: { kind: "paste", url: "https://itch.io/user/settings/api-keys", instructions: "Sign in to itch.io in your browser, generate a new API key on your API keys page, and paste the key here.", placeholder: "API key" },
   }),
 ];
 
@@ -231,17 +244,27 @@ mockIPC(
         });
       case "refresh_store_library":
         await delay(800);
-        return updateAccount(a.store, { fetched_at: Math.floor(Date.now() / 1000) });
+        if (accounts.find((x) => x.key === a.store)?.needs_sign_in) {
+          throw "The store rejected the saved login (401 Unauthorized from https://www.humblebundle.com/api/v1/user/order). Sign in again.";
+        }
+        return updateAccount(a.store, { fetched_at: Math.floor(Date.now() / 1000), last_error: null });
       case "sign_out_store":
-        return updateAccount(a.store, { signed_in: false, account_name: null, game_count: null, fetched_at: null });
+        return updateAccount(a.store, {
+          signed_in: false,
+          account_name: null,
+          game_count: null,
+          fetched_at: null,
+          last_error: null,
+          needs_sign_in: false,
+        });
       case "submit_store_login":
         await delay(800);
-        return updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 12, fetched_at: Math.floor(Date.now() / 1000), enabled: true });
+        return updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 12, fetched_at: Math.floor(Date.now() / 1000), enabled: true, last_error: null, needs_sign_in: false });
       case "open_store_sign_in_page":
         return null;
       case "start_store_login":
         setTimeout(() => {
-          updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 42, fetched_at: Math.floor(Date.now() / 1000), enabled: true });
+          updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 42, fetched_at: Math.floor(Date.now() / 1000), enabled: true, last_error: null, needs_sign_in: false });
           void emit("store-login", { store: a.store, ok: true, message: "Signed in as player1" });
         }, 1500);
         return null;

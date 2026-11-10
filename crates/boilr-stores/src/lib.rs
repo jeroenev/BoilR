@@ -134,7 +134,7 @@ pub struct OwnedLibrary {
 
 /// A signed-in account. `data` is owned by the store module (tokens, cookies, ids) and is
 /// stored as-is in the user's config folder, readable only by the user.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub account_name: Option<String>,
     pub data: serde_json::Value,
@@ -239,8 +239,18 @@ pub async fn complete_login(
     pending: &PendingLogin,
     capture: &LoginCapture,
 ) -> eyre::Result<Option<String>> {
+    complete_login_inner(pending, capture)
+        .await
+        .map_err(redacted)
+}
+
+async fn complete_login_inner(
+    pending: &PendingLogin,
+    capture: &LoginCapture,
+) -> eyre::Result<Option<String>> {
+    let store = pending.store;
     let client = http::client()?;
-    let session = match pending.store {
+    let session = match store {
         StoreId::Epic => epic::complete_login(&client, pending, capture).await,
         StoreId::Gog => gog::complete_login(&client, pending, capture).await,
         StoreId::Amazon => amazon::complete_login(&client, pending, capture).await,
@@ -249,9 +259,51 @@ pub async fn complete_login(
         StoreId::Humble => humble::complete_login(&client, pending, capture).await,
         StoreId::Itch => itch::complete_login(&client, pending, capture).await,
     }?;
-    save_session(pending.store, &session)?;
-    end_pending_login(pending.store);
+    save_new_login(store, &session)?;
+    end_pending_login(store);
+    record_failure(store, None);
     Ok(session.account_name)
+}
+
+fn save_new_login(store: StoreId, session: &Session) -> eyre::Result<()> {
+    let _lock = storage::lock_account(store)?;
+    save_session(store, session)?;
+    // The cached library may be another account's: fetch it again on next use.
+    if let Some(mut library) = cached_library(store) {
+        library.fetched_at = 0;
+        save_library(store, &library)?;
+    }
+    Ok(())
+}
+
+/// The error as one message (with its causes) and without secrets, keeping whether the store
+/// rejected the login.
+fn redacted(err: eyre::Report) -> eyre::Report {
+    let message = http::redact(&format!("{err:#}"));
+    if http::is_login_rejected(&err) {
+        http::login_rejected(message)
+    } else if is_account_changed(&err) {
+        eyre::Report::new(AccountChanged(message))
+    } else {
+        eyre::Report::msg(message)
+    }
+}
+
+/// The account was signed out of, or signed in again, while a refresh was running. The
+/// refresh's results belong to the old login and were dropped.
+#[derive(Debug)]
+struct AccountChanged(String);
+
+impl std::fmt::Display for AccountChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AccountChanged {}
+
+fn is_account_changed(err: &eyre::Report) -> bool {
+    err.chain().any(|cause| cause.is::<AccountChanged>())
 }
 
 /// One lock per store: two refreshes of the same account at once would both use (and
@@ -270,28 +322,66 @@ fn refresh_lock(store: StoreId) -> Arc<tokio::sync::Mutex<()>> {
         .unwrap_or_default()
 }
 
-/// When a refresh of each store last failed (Unix seconds), so listing games does not retry
-/// an unreachable store on every call.
-static LAST_FAILURE: Mutex<BTreeMap<StoreId, u64>> = Mutex::new(BTreeMap::new());
+/// The last failed refresh of a store, so listing games does not retry an unreachable store
+/// on every call, and front ends can say what went wrong.
+#[derive(Clone, Debug)]
+struct Failure {
+    /// Unix seconds.
+    at: u64,
+    message: String,
+    needs_sign_in: bool,
+}
+
+static LAST_FAILURE: Mutex<BTreeMap<StoreId, Failure>> = Mutex::new(BTreeMap::new());
 
 /// How long [`refresh_if_stale`] waits after a failed refresh before it tries again.
 pub const RETRY_AFTER_FAILURE_SECS: u64 = 15 * 60;
 
-fn record_failure(store: StoreId, failed: bool) {
+/// Records the outcome of a refresh: `None` clears the failure.
+fn record_failure(store: StoreId, error: Option<&eyre::Report>) {
     let mut failures = LAST_FAILURE.lock().unwrap_or_else(PoisonError::into_inner);
-    if failed {
-        failures.insert(store, now_unix());
-    } else {
-        failures.remove(&store);
+    match error {
+        Some(err) => {
+            let message = err.to_string();
+            failures.insert(
+                store,
+                Failure {
+                    at: now_unix(),
+                    needs_sign_in: http::is_login_rejected(err)
+                        || message.to_lowercase().contains("sign in again"),
+                    message,
+                },
+            );
+        }
+        None => {
+            failures.remove(&store);
+        }
     }
 }
 
-fn failed_recently(store: StoreId) -> bool {
+fn last_failure(store: StoreId) -> Option<Failure> {
     LAST_FAILURE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&store)
-        .is_some_and(|at| now_unix().saturating_sub(*at) < RETRY_AFTER_FAILURE_SECS)
+        .cloned()
+}
+
+fn failed_recently(store: StoreId) -> bool {
+    last_failure(store)
+        .is_some_and(|failure| now_unix().saturating_sub(failure.at) < RETRY_AFTER_FAILURE_SECS)
+}
+
+/// Runs a refresh and records how it went. A refresh dropped because the account changed is
+/// not a failure of the new login.
+async fn refresh_and_record(store: StoreId) -> eyre::Result<OwnedLibrary> {
+    let result = refresh_library_locked(store).await.map_err(redacted);
+    match &result {
+        Ok(_) => record_failure(store, None),
+        Err(err) if is_account_changed(err) => {}
+        Err(err) => record_failure(store, Some(err)),
+    }
+    result
 }
 
 /// The cached library, or `None` when there is none or it can't be read (a damaged file is
@@ -314,9 +404,7 @@ pub fn cached_library(store: StoreId) -> Option<OwnedLibrary> {
 pub async fn refresh_library(store: StoreId) -> eyre::Result<OwnedLibrary> {
     let lock = refresh_lock(store);
     let _guard = lock.lock().await;
-    let result = refresh_library_locked(store).await;
-    record_failure(store, result.is_err());
-    result
+    refresh_and_record(store).await
 }
 
 /// The library for listing games: the cached one, fetched again first when it is older than
@@ -343,13 +431,12 @@ pub async fn refresh_if_stale(store: StoreId, max_age_secs: u64) -> eyre::Result
             )
         });
     }
-    let result = refresh_library_locked(store).await;
-    record_failure(store, result.is_err());
-    match (result, cached) {
+    match (refresh_and_record(store).await, cached) {
         (Ok(library), _) => Ok(library),
+        (Err(err), _) if is_account_changed(&err) => Err(err),
         (Err(err), Some(cached)) => {
             eprintln!(
-                "Could not refresh the {} library, using the one from before: {err:?}",
+                "Could not refresh the {} library, using the one from before: {err}",
                 store.display_name()
             );
             Ok(cached)
@@ -359,8 +446,9 @@ pub async fn refresh_if_stale(store: StoreId, max_age_secs: u64) -> eyre::Result
 }
 
 async fn refresh_library_locked(store: StoreId) -> eyre::Result<OwnedLibrary> {
-    let mut session = load_session(store)?
+    let started_with = load_session(store)?
         .ok_or_else(|| eyre::format_err!("Not signed in to {}", store.display_name()))?;
+    let mut session = started_with.clone();
     let client = http::client()?;
     let result = match store {
         StoreId::Epic => epic::fetch_owned(&client, &mut session).await,
@@ -371,12 +459,44 @@ async fn refresh_library_locked(store: StoreId) -> eyre::Result<OwnedLibrary> {
         StoreId::Humble => humble::fetch_owned(&client, &mut session).await,
         StoreId::Itch => itch::fetch_owned(&client, &mut session).await,
     };
-    // Tokens may have been refreshed even when listing the games failed.
-    save_session(store, &session)?;
+    commit_refresh(store, &started_with, &session, result)
+}
+
+/// Saves what a refresh produced: the session (tokens may have been renewed even when listing
+/// the games failed) and the library.
+fn commit_refresh(
+    store: StoreId,
+    started_with: &Session,
+    session: &Session,
+    result: eyre::Result<Vec<OwnedGame>>,
+) -> eyre::Result<OwnedLibrary> {
+    let _lock = storage::lock_account(store)?;
+    // Signing out (or in again) while the games were being fetched wins: saving now would
+    // bring back the old login.
+    if load_session(store)?.as_ref() != Some(started_with) {
+        return Err(eyre::Report::new(AccountChanged(format!(
+            "The {} account changed while its games were being fetched; that list was dropped.",
+            store.display_name()
+        ))));
+    }
+    if session != started_with {
+        save_session(store, session)?;
+    }
     let mut games = result?;
     games.retain(|g| !g.id.is_empty() && !g.title.trim().is_empty());
     games.sort_by(|a, b| a.id.cmp(&b.id));
     games.dedup_by(|a, b| a.id == b.id);
+    if games.is_empty() {
+        if let Some(before) = cached_library(store).filter(|l| !l.games.is_empty()) {
+            return Err(eyre::format_err!(
+                "{} listed no games, but it listed {} before. The earlier list is kept, \
+                 because an empty answer is more likely a store problem than an empty \
+                 account. If the account really has no games, sign out and in again.",
+                store.display_name(),
+                before.games.len()
+            ));
+        }
+    }
     let library = OwnedLibrary {
         account_name: session.account_name.clone(),
         fetched_at: now_unix(),
@@ -386,11 +506,42 @@ async fn refresh_library_locked(store: StoreId) -> eyre::Result<OwnedLibrary> {
     Ok(library)
 }
 
-/// Signs out: removes the session and the cached library.
+/// Signs out. Where the store offers a way, it is told first that BoilR's login is no longer
+/// needed: Amazon removes BoilR from the account's devices and Epic ends the session. The
+/// other stores keep the login valid until it expires. Then the session and the cached
+/// library are removed, also when the store could not be told; that case returns a warning.
+pub async fn sign_out(store: StoreId) -> eyre::Result<Option<String>> {
+    let warning = match load_session(store).ok().flatten() {
+        Some(session) => end_remote_session(store, &session).await.err().map(|err| {
+            format!(
+                "Signed out, but {} may still list BoilR's login: {}",
+                store.display_name(),
+                redacted(err)
+            )
+        }),
+        None => None,
+    };
+    delete_account(store)?;
+    Ok(warning)
+}
+
+async fn end_remote_session(store: StoreId, session: &Session) -> eyre::Result<()> {
+    let client = http::client()?;
+    match store {
+        StoreId::Amazon => amazon::sign_out(&client, session).await,
+        StoreId::Epic => epic::sign_out(&client, session).await,
+        StoreId::Gog | StoreId::Ea | StoreId::BattleNet | StoreId::Humble | StoreId::Itch => Ok(()),
+    }
+}
+
+/// Removes the session and the cached library, without telling the store; see [`sign_out`].
 pub fn delete_account(store: StoreId) -> eyre::Result<()> {
-    storage::delete_account(store)?;
+    {
+        let _lock = storage::lock_account(store)?;
+        storage::delete_account(store)?;
+    }
     end_pending_login(store);
-    record_failure(store, false);
+    record_failure(store, None);
     Ok(())
 }
 
@@ -405,6 +556,9 @@ pub fn is_stale(library: Option<&OwnedLibrary>, max_age_secs: u64) -> bool {
 /// The state of one store account, for display.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountStatus {
+    /// Written as the store's [`StoreId::key`] (`battlenet`), the same as `key`, so front
+    /// ends can use either.
+    #[serde(with = "store_key")]
     pub store: StoreId,
     pub key: String,
     pub name: String,
@@ -415,6 +569,27 @@ pub struct AccountStatus {
     pub manual: ManualLogin,
     /// Whether the built-in login window can sign in to this store.
     pub webview_login: bool,
+    /// Why the last refresh failed, while it has not succeeded since (this run of the app).
+    pub last_error: Option<String>,
+    /// The last refresh failed because the store no longer accepts the saved login.
+    pub needs_sign_in: bool,
+}
+
+/// A [`StoreId`] as its key. `StoreId`'s own serde form (`battle_net`) stays as it is: saved
+/// libraries use it.
+mod store_key {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    use crate::StoreId;
+
+    pub fn serialize<S: Serializer>(store: &StoreId, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(store.key())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<StoreId, D::Error> {
+        let key = String::deserialize(deserializer)?;
+        StoreId::from_key(&key).ok_or_else(|| D::Error::custom(format!("unknown store {key}")))
+    }
 }
 
 /// Reads the session and the cached library from disk; front ends call it after a change,
@@ -423,6 +598,7 @@ pub fn account_status(store: StoreId) -> AccountStatus {
     let session = load_session(store).ok().flatten();
     let library = load_library(store).ok().flatten();
     let pending = pending_login(store);
+    let failure = last_failure(store).filter(|_| session.is_some());
     AccountStatus {
         store,
         key: store.key().to_string(),
@@ -435,6 +611,8 @@ pub fn account_status(store: StoreId) -> AccountStatus {
         fetched_at: library.map(|l| l.fetched_at),
         manual: pending.manual,
         webview_login: !pending.done_url_prefixes.is_empty(),
+        needs_sign_in: failure.as_ref().is_some_and(|f| f.needs_sign_in),
+        last_error: failure.map(|f| f.message),
     }
 }
 
@@ -464,9 +642,145 @@ mod tests {
 
     #[test]
     fn recent_failures_hold_off_retries() {
-        record_failure(StoreId::Humble, true);
+        record_failure(
+            StoreId::Humble,
+            Some(&http::login_rejected("401 from https://x. Sign in again.")),
+        );
         assert!(failed_recently(StoreId::Humble));
-        record_failure(StoreId::Humble, false);
+        assert!(last_failure(StoreId::Humble).is_some_and(|f| f.needs_sign_in));
+        record_failure(StoreId::Humble, None);
         assert!(!failed_recently(StoreId::Humble));
+    }
+
+    #[test]
+    fn account_status_names_the_store_by_its_key() -> eyre::Result<()> {
+        let status = serde_json::to_value(account_status(StoreId::BattleNet))?;
+        assert_eq!(status.get("store"), Some(&serde_json::json!("battlenet")));
+        assert_eq!(status.get("key"), Some(&serde_json::json!("battlenet")));
+        let back: AccountStatus = serde_json::from_value(status)?;
+        assert_eq!(back.store, StoreId::BattleNet);
+        Ok(())
+    }
+
+    #[test]
+    fn redacted_errors_keep_their_kind_and_lose_secrets() {
+        let err = http::login_rejected("401 from https://a.com/x?refresh_token=SECRET")
+            .wrap_err("Could not load the library");
+        let clean = redacted(err);
+        assert!(http::is_login_rejected(&clean));
+        let message = clean.to_string();
+        assert!(message.contains("Could not load the library"), "{message}");
+        assert!(message.contains("https://a.com/x"), "{message}");
+        assert!(!message.contains("SECRET"), "{message}");
+    }
+
+    fn session(token: &str) -> Session {
+        Session {
+            account_name: Some("player".into()),
+            data: serde_json::json!({ "token": token }),
+        }
+    }
+
+    fn library(count: usize) -> OwnedLibrary {
+        OwnedLibrary {
+            account_name: Some("player".into()),
+            fetched_at: 1,
+            games: (0..count)
+                .map(|i| OwnedGame::new(StoreId::Itch, i.to_string(), "Game"))
+                .collect(),
+        }
+    }
+
+    fn games(count: usize) -> eyre::Result<Vec<OwnedGame>> {
+        Ok(library(count).games)
+    }
+
+    // Each test uses its own store: tests run at the same time and share the test folder.
+    #[test]
+    fn a_refresh_never_saves_over_a_sign_out() -> eyre::Result<()> {
+        let store = StoreId::Itch;
+        let started_with = session("old");
+        save_session(store, &started_with)?;
+        delete_account(store)?;
+
+        let result = commit_refresh(store, &started_with, &session("renewed"), games(2));
+        assert!(result.is_err_and(|e| is_account_changed(&e)));
+        assert_eq!(load_session(store)?, None);
+        assert!(cached_library(store).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_refresh_never_saves_over_a_new_sign_in() -> eyre::Result<()> {
+        let store = StoreId::BattleNet;
+        let started_with = session("old");
+        save_session(store, &started_with)?;
+        save_new_login(store, &session("new"))?;
+
+        let result = commit_refresh(store, &started_with, &session("renewed"), games(2));
+        assert!(result.is_err_and(|e| is_account_changed(&e)));
+        assert_eq!(load_session(store)?, Some(session("new")));
+        delete_account(store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_refresh_saves_renewed_tokens_even_when_listing_fails() -> eyre::Result<()> {
+        let store = StoreId::Amazon;
+        let started_with = session("old");
+        save_session(store, &started_with)?;
+
+        let failed = commit_refresh(
+            store,
+            &started_with,
+            &session("renewed"),
+            Err(eyre::format_err!("network down")),
+        );
+        assert!(failed.is_err());
+        assert_eq!(load_session(store)?, Some(session("renewed")));
+
+        let renewed = session("renewed");
+        let saved = commit_refresh(store, &renewed, &renewed, games(2))?;
+        assert_eq!(saved.games.len(), 2);
+        assert_eq!(cached_library(store).map(|l| l.games.len()), Some(2));
+        delete_account(store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_answer_does_not_replace_a_library() -> eyre::Result<()> {
+        let store = StoreId::Humble;
+        let current = session("t");
+        save_session(store, &current)?;
+        save_library(store, &library(3))?;
+
+        assert!(commit_refresh(store, &current, &current, games(0)).is_err());
+        assert_eq!(cached_library(store).map(|l| l.games.len()), Some(3));
+
+        // After signing out and in again there is no earlier list to protect.
+        delete_account(store)?;
+        save_session(store, &current)?;
+        assert!(commit_refresh(store, &current, &current, games(0))?
+            .games
+            .is_empty());
+        delete_account(store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn signing_in_again_makes_the_library_stale() -> eyre::Result<()> {
+        let store = StoreId::Epic;
+        save_library(
+            store,
+            &OwnedLibrary {
+                fetched_at: now_unix(),
+                ..library(3)
+            },
+        )?;
+        save_new_login(store, &session("new"))?;
+        assert!(is_stale(cached_library(store).as_ref(), 60));
+        assert_eq!(cached_library(store).map(|l| l.games.len()), Some(3));
+        delete_account(store)?;
+        Ok(())
     }
 }

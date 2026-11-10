@@ -9,7 +9,9 @@ import type {
   PlatformSummary,
   PlatformToggleResponse,
   SettingsUpdatePayload,
+  LoginResult,
   ShortcutSummary,
+  StoreLoginEvent,
   SyncOutcome,
   SyncPlan,
   SyncProgressEvent,
@@ -154,6 +156,30 @@ const App = () => {
   const refreshAfterAccountChange = useCallback(() => {
     void fetchAll().catch((err) => setLoadError(errorMessage(err)));
   }, [fetchAll]);
+
+  // A login window can finish while another view is open, so the result is caught here,
+  // not in the accounts view; that view shows it when it is (or next becomes) visible.
+  const [loginResult, setLoginResult] = useState<LoginResult | null>(null);
+  const clearLoginResult = useCallback(() => setLoginResult(null), []);
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    let seq = 0;
+    listen<StoreLoginEvent>("store-login", (event) => {
+      if (!active) return;
+      seq += 1;
+      setLoginResult({ ...event.payload, seq });
+      if (event.payload.ok) refreshAfterAccountChange();
+    })
+      .then((stop) => {
+        unlisten = stop;
+      })
+      .catch((err) => console.error("Failed to listen for store logins", err));
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [refreshAfterAccountChange]);
 
   const updateSettings = useCallback(
     async (patch: SettingsUpdatePayload) => {
@@ -360,7 +386,11 @@ const App = () => {
             </div>
           </div>
         ) : view === "accounts" ? (
-          <AccountsView onAccountsChanged={refreshAfterAccountChange} />
+          <AccountsView
+            onAccountsChanged={refreshAfterAccountChange}
+            loginResult={loginResult}
+            onLoginResultSeen={clearLoginResult}
+          />
         ) : view === "artwork" ? (
           <ArtworkView settings={settings} onSettingsChanged={setSettings} />
         ) : view === "shortcuts" ? (

@@ -16,12 +16,32 @@ fn store_folder(store: StoreId) -> PathBuf {
     stores_root().join(store.key())
 }
 
+#[cfg(not(test))]
 fn stores_root() -> PathBuf {
-    // Tests point this at a temporary folder.
-    if let Some(dir) = std::env::var_os("BOILR_STORES_DIR") {
-        return PathBuf::from(dir);
-    }
     boilr_core::config::get_config_folder().join("stores")
+}
+
+/// Tests never touch the user's real accounts.
+#[cfg(test)]
+pub(crate) fn stores_root() -> PathBuf {
+    std::env::temp_dir().join(format!("boilr-stores-test-{}", std::process::id()))
+}
+
+/// Holds an OS file lock on one store's files until dropped. The classic app, the Tauri app
+/// and `boilr --no-ui` may run at once; every change to a store's session or library is made
+/// under this lock. It is only held for file work, never during a network request. The lock
+/// file lives outside the store's folder, so signing out can remove that folder while another
+/// process waits for the lock.
+pub(crate) fn lock_account(store: StoreId) -> eyre::Result<fs::File> {
+    let folder = stores_root().join(".locks");
+    fs::create_dir_all(&folder)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(folder.join(format!("{}.lock", store.key())))?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn session_file(store: StoreId) -> PathBuf {
@@ -113,9 +133,6 @@ mod tests {
 
     #[test]
     fn round_trips_session_and_library() -> eyre::Result<()> {
-        let dir = std::env::temp_dir().join(format!("boilr-stores-test-{}", std::process::id()));
-        std::env::set_var("BOILR_STORES_DIR", &dir);
-
         assert!(load_session(StoreId::Gog)?.is_none());
         let session = Session {
             account_name: Some("player".into()),
@@ -168,7 +185,6 @@ mod tests {
 
         delete_account(StoreId::Gog)?;
         assert!(load_session(StoreId::Gog)?.is_none());
-        let _ = fs::remove_dir_all(dir);
         Ok(())
     }
 }

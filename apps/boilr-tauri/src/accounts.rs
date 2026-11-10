@@ -24,6 +24,10 @@ pub struct StoreAccount {
     code_name: String,
     enabled: bool,
     install_with: InstallWith,
+    /// Something the user should know about the action that returned this account, such as
+    /// a sign-out the store could not be told about, or a first fetch that failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +58,14 @@ fn account(store: StoreId) -> StoreAccount {
         code_name: code_name.to_string(),
         enabled,
         install_with,
+        notice: None,
+    }
+}
+
+fn account_with_notice(store: StoreId, notice: Option<String>) -> StoreAccount {
+    StoreAccount {
+        notice,
+        ..account(store)
     }
 }
 
@@ -101,11 +113,13 @@ pub async fn refresh_store_library(store: String) -> Result<StoreAccount, String
     Ok(account(store))
 }
 
-#[tauri::command(async)]
-pub fn sign_out_store(store: String) -> Result<StoreAccount, String> {
+#[tauri::command]
+pub async fn sign_out_store(store: String) -> Result<StoreAccount, String> {
     let store = parse_store(&store)?;
-    stores::delete_account(store).map_err(|err| err.to_string())?;
-    Ok(account(store))
+    let warning = stores::sign_out(store)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(account_with_notice(store, warning))
 }
 
 /// Opens the store's sign-in page for a manual login in the user's own browser.
@@ -151,18 +165,23 @@ pub async fn submit_store_login(store: String, pasted: String) -> Result<StoreAc
     stores::complete_login(&pending, &capture)
         .await
         .map_err(|err| err.to_string())?;
-    after_sign_in(store).await;
-    Ok(account(store))
+    let notice = after_sign_in(store).await;
+    Ok(account_with_notice(store, notice))
 }
 
-/// A first library fetch, and the account turned on as a game source.
-async fn after_sign_in(store: StoreId) {
+/// A first library fetch, and the account turned on as a game source. Returns what went
+/// wrong, for the user: the sign-in itself worked.
+async fn after_sign_in(store: StoreId) -> Option<String> {
+    let mut problems = vec![];
     if let Err(err) = set_account_settings(store, Some(true), None) {
-        eprintln!("Could not turn on the {} account: {err}", store.key());
+        problems.push(format!(
+            "Could not turn on the account as a game source: {err}"
+        ));
     }
     if let Err(err) = stores::refresh_library(store).await {
-        eprintln!("Could not fetch the {} library: {err:?}", store.key());
+        problems.push(format!("Could not list its games yet: {err}"));
     }
+    (!problems.is_empty()).then(|| problems.join(" "))
 }
 
 /// Opens the store's sign-in page in its own window. When the window reaches the page the
@@ -263,13 +282,17 @@ async fn finish_login(
     }
     let event = match result {
         Ok(name) => {
-            after_sign_in(store).await;
+            let notice = after_sign_in(store).await;
+            let signed_in = match name {
+                Some(name) => format!("Signed in as {name}."),
+                None => "Signed in.".to_string(),
+            };
             LoginEvent {
                 store: store.key().to_string(),
                 ok: true,
-                message: match name {
-                    Some(name) => format!("Signed in as {name}"),
-                    None => "Signed in".to_string(),
+                message: match notice {
+                    Some(notice) => format!("{signed_in} {notice}"),
+                    None => signed_in,
                 },
             }
         }

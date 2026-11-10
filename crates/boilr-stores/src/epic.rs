@@ -40,6 +40,8 @@ const LOGIN_URL: &str = "https://www.epicgames.com/id/login";
 const REDIRECT_URL: &str = "https://www.epicgames.com/id/api/redirect";
 const OAUTH_TOKEN_URL: &str =
     "https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/token";
+const SESSION_KILL_URL: &str =
+    "https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/sessions/kill/";
 const ACCOUNT_URL: &str =
     "https://account-public-service-prod03.ol.epicgames.com/account/api/public/account/";
 const LIBRARY_ITEMS_URL: &str =
@@ -393,6 +395,28 @@ impl EpicSession {
 
     fn needs_refresh(&self, now: u64) -> bool {
         now.saturating_add(REFRESH_MARGIN_SECS) >= self.access_expires_at
+    }
+}
+
+/// Ends the session on Epic's side, as legendary does when it logs out. The access token is
+/// part of the URL, so no error here mentions the URL.
+pub async fn sign_out(client: &Client, session: &Session) -> eyre::Result<()> {
+    let mut data: EpicSession = serde_json::from_value(session.data.clone())?;
+    if data.needs_refresh(now_unix()) {
+        refresh(client, &mut data, &mut session.clone()).await?;
+    }
+    let response = authorized(
+        client.delete(format!("{SESSION_KILL_URL}{}", data.access_token)),
+        &data.access_token,
+    )
+    .send()
+    .await
+    .map_err(|err| eyre::format_err!("Epic could not be reached: {}", err.without_url()))?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(eyre::format_err!("Epic answered {status}"))
     }
 }
 

@@ -10,6 +10,8 @@ export type ShortcutSummary = {
   blacklisted: boolean;
   /** False for games a store account owns that are not installed. */
   installed: boolean;
+  /** For a game that is not installed, what its shortcut does ("Opens GOG Galaxy to install it"). */
+  opens?: string | null;
 };
 
 export type PlatformSummary = {
@@ -175,6 +177,7 @@ export type InstallWith = "auto" | "heroic" | "browser";
 
 /** A store BoilR signs in to itself (`boilr-stores`), listing every game the account owns. */
 export type StoreAccount = {
+  /** The same as `key`. */
   store: string;
   key: string;
   name: string;
@@ -186,10 +189,17 @@ export type StoreAccount = {
   manual: ManualLogin;
   /** Whether a login window can sign in to this store. */
   webview_login: boolean;
+  /** Why the last library refresh failed, while it has not succeeded since. */
+  last_error: string | null;
+  /** The last refresh failed because the store no longer accepts the saved sign-in. */
+  needs_sign_in: boolean;
   /** The platform code name of the account, as in the game sources. */
   code_name: string;
   enabled: boolean;
   install_with: InstallWith;
+  /** About the action that returned this account: a sign-out the store could not be told
+   * about, or a first library fetch that failed. */
+  notice?: string;
 };
 
 export type StoreLoginEvent = {
@@ -197,3 +207,6 @@ export type StoreLoginEvent = {
   ok: boolean;
   message: string;
 };
+
+/** A `store-login` event as App hands it to the accounts view; `seq` tells events apart. */
+export type LoginResult = StoreLoginEvent & { seq: number };
