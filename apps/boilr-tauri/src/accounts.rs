@@ -143,10 +143,13 @@ pub fn open_store_sign_in_page(store: String) -> Result<(), String> {
 }
 
 fn open_in_browser(url: &str) -> std::io::Result<()> {
+    // Windows' URL handler opens the default browser. `explorer <url>` does that only for
+    // short, simple links: a long sign-in link (Amazon's) or one with commas opens File
+    // Explorer instead.
     #[cfg(windows)]
     let mut command = {
-        let mut command = std::process::Command::new("explorer");
-        command.arg(url);
+        let mut command = std::process::Command::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler").arg(url);
         command
     };
     #[cfg(not(windows))]
