@@ -126,7 +126,8 @@ fixtures made from the reference code's models. These need a real account, and s
 Windows:
 
 - **Every sign-in, end to end:**
-  - Epic's captcha in the login window. It uses the launcher's user agent, as Playnite does.
+  - Epic's captcha in the login window. It uses an ordinary browser's user agent: with the
+    launcher's, as Playnite used, the sign-in stops after two-factor authentication.
   - Amazon's sign-in page in a webview.
   - Which EA and Battle.net cookies keep the session alive. A login window reports a
     cookie's domain without its leading dot, so BoilR sends every saved cookie to its

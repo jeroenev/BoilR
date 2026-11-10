@@ -41,9 +41,12 @@ const CLIENT_SECRET: &str = "daafbccc737745039dffe53d94fc76cf";
 /// legendary's launcher user agent for the account, library and catalog services.
 const LAUNCHER_USER_AGENT: &str =
     "UELauncher/11.0.1-14907503+++Portal+Release-Live Windows/10.0.19041.1.256.64bit";
-/// The user agent of the login window (Playnite's; Epic's captcha only passes for the
-/// launcher's). Whatever replays the window's cookies sends the same one.
-const LOGIN_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EpicGamesLauncher";
+/// The user agent of the login window: an ordinary browser's, as the login works in a
+/// browser. With the launcher's own (`... EpicGamesLauncher`, which Playnite used), Epic's
+/// sign-in finishes as the launcher's and stops after two-factor authentication with
+/// "Invalid client, redirect url is not known to the client". Whatever replays the window's
+/// cookies sends the same one.
+const LOGIN_USER_AGENT: &str = http::BROWSER_USER_AGENT;
 
 const LOGIN_URL: &str = "https://www.epicgames.com/id/login";
 const REDIRECT_URL: &str = "https://www.epicgames.com/id/api/redirect";
