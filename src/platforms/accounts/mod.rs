@@ -17,9 +17,67 @@ pub use merge::{drop_owned_duplicates, not_installed_collection, NOT_INSTALLED_C
 pub use platform::{AccountPlatform, AccountSettings, InstallWith};
 pub use targets::describe_install_target;
 
-/// Libraries older than this are fetched again when games are listed
-/// (see [`stores::refresh_if_stale`]).
+/// Libraries older than this are fetched again by [`refresh_stale_libraries`].
 pub const LIBRARY_MAX_AGE_SECS: u64 = 6 * 60 * 60;
+
+/// Fetches the libraries that got old, of every account that is signed in and turned on as
+/// a source: all stores at once, each for at most [`stores::REFRESH_DEADLINE`]. A store
+/// that fails keeps its last list. Returns the stores whose list was fetched again.
+///
+/// This talks to the stores, so it runs in the background or before a sync without a
+/// window; listing games only reads what was last fetched.
+pub fn refresh_stale_libraries() -> Vec<StoreId> {
+    let accounts: Vec<StoreId> = crate::platforms::get_platforms()
+        .iter()
+        .filter(|platform| platform.enabled())
+        .filter_map(|platform| store_for_code_name(platform.code_name()))
+        .collect();
+    refresh_stale(&accounts)
+}
+
+/// [`refresh_stale_libraries`] for the account behind one source, when it is one; a no-op
+/// for every other source.
+pub fn refresh_stale_library(code_name: &str) {
+    if let Some(store) = store_for_code_name(code_name) {
+        refresh_stale(&[store]);
+    }
+}
+
+fn refresh_stale(accounts: &[StoreId]) -> Vec<StoreId> {
+    let stale: Vec<StoreId> = accounts
+        .iter()
+        .copied()
+        .filter(|store| matches!(stores::load_session(*store), Ok(Some(_))))
+        .filter(|store| {
+            stores::is_stale(
+                stores::cached_library(*store).as_ref(),
+                LIBRARY_MAX_AGE_SECS,
+            )
+        })
+        .collect();
+    if stale.is_empty() {
+        return vec![];
+    }
+    let fetched_before: Vec<Option<u64>> = stale.iter().map(|store| fetched_at(*store)).collect();
+    let refreshed = block_on_fresh(futures::future::join_all(
+        stale
+            .iter()
+            .map(|store| stores::refresh_if_stale(*store, LIBRARY_MAX_AGE_SECS)),
+    ));
+    if let Err(err) = refreshed {
+        eprintln!("Could not refresh the store libraries: {err}");
+    }
+    stale
+        .into_iter()
+        .zip(fetched_before)
+        .filter(|(store, before)| fetched_at(*store) != *before)
+        .map(|(store, _)| store)
+        .collect()
+}
+
+fn fetched_at(store: StoreId) -> Option<u64> {
+    stores::cached_library(store).map(|library| library.fetched_at)
+}
 
 /// The settings section (and platform code name) of a store account. Never change these.
 pub fn account_code_name(store: StoreId) -> &'static str {

@@ -26,10 +26,7 @@ use boilr_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use steam_shortcuts_util::{
-    calculate_app_id_for_shortcut,
-    shortcut::{Shortcut, ShortcutOwned},
-};
+use steam_shortcuts_util::shortcut::ShortcutOwned;
 use tauri::{Emitter, Manager};
 use tokio::runtime::Runtime;
 use toml::Value;
@@ -74,8 +71,7 @@ fn discover_games() -> Result<Vec<PlatformSummary>, String> {
                     installed,
                 } = shortcut;
                 let app_id = shortcut.app_id;
-                let display_name = rename_map
-                    .get(&app_id)
+                let display_name = sync::rename_for(&shortcut, &rename_map)
                     .cloned()
                     .unwrap_or_else(|| shortcut.app_name.clone());
                 let blacklisted = settings.blacklisted_games.contains(&app_id);
@@ -280,6 +276,7 @@ fn main() {
                     eprintln!("Failed to emit {event} event: {err}");
                 }
             })));
+            accounts::refresh_libraries_in_background(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -534,18 +531,13 @@ fn prepare_additions(
             }
 
             let mut shortcut = entry.shortcut.clone();
-            if let Some(rename) = rename_map.get(&entry.shortcut.app_id) {
+            if let Some(rename) = sync::rename_for(&entry.shortcut, rename_map) {
+                // The id the sync gives it: a game that is not installed keeps its id.
+                let owned = sync::has_owned_app_id(&shortcut);
                 shortcut.app_name = rename.clone();
-                let template = Shortcut::new(
-                    "0",
-                    shortcut.app_name.as_str(),
-                    &shortcut.exe,
-                    "",
-                    "",
-                    "",
-                    "",
-                );
-                shortcut.app_id = calculate_app_id_for_shortcut(&template);
+                if !owned {
+                    shortcut.app_id = sync::app_id_after_change(&shortcut);
+                }
             }
 
             let display_name = shortcut.app_name.clone();

@@ -18,7 +18,10 @@ use eyre::WrapErr;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{http, now_unix, LoginCapture, ManualLogin, OwnedGame, PendingLogin, Session, StoreId};
+use crate::{
+    clean_title, http, now_unix, session_data, Fetch, LoginCapture, ManualLogin, OwnedGame,
+    PendingLogin, Session, StoreId,
+};
 
 /// The GOG Galaxy client's OAuth client. Public: shipped in Galaxy and used by Heroic's
 /// gogdl and Minigalaxy.
@@ -34,8 +37,9 @@ const PRODUCTS_URL: &str = "https://embed.gog.com/account/getFilteredProducts";
 
 /// Refresh the access token when it expires within this many seconds.
 const REFRESH_MARGIN_SECS: u64 = 120;
-/// Guards against a server that keeps reporting more pages.
-const MAX_PAGES: u32 = 500;
+/// More pages than this is taken as a server that keeps reporting more pages: an error, not
+/// the end of the list.
+const MAX_PAGES: usize = 500;
 
 /// Products GOG files as games that are only goodies (comics, artbooks, wallpapers).
 /// List from Minigalaxy (`minigalaxy/constants.py`, `IGNORE_GAME_IDS`).
@@ -49,7 +53,7 @@ const NOT_GAMES: [&str; 6] = [
 ];
 
 /// What BoilR keeps in [`Session::data`] for GOG.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GogSession {
     pub access_token: String,
     pub refresh_token: String,
@@ -58,8 +62,21 @@ pub struct GogSession {
     pub expires_at: u64,
 }
 
-/// Response of `auth.gog.com/token` (for both the code and the refresh grant).
-#[derive(Debug, Deserialize)]
+// The tokens stay out of `Debug` output, so a stray `{:?}` cannot put them in a log.
+impl std::fmt::Debug for GogSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GogSession")
+            .field("access_token", &"<hidden>")
+            .field("refresh_token", &"<hidden>")
+            .field("user_id", &self.user_id)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Response of `auth.gog.com/token` (for both the code and the refresh grant). It holds
+/// tokens, so it has no `Debug`.
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     refresh_token: String,
@@ -78,11 +95,11 @@ struct UserResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProductsPage {
-    #[serde(default)]
-    page: u32,
+    /// 0 when GOG does not say.
     #[serde(default)]
     total_pages: u32,
-    #[serde(default)]
+    /// Required: an answer without it is not a page of the library, and must not be read as
+    /// an empty one.
     products: Vec<Product>,
 }
 
@@ -106,6 +123,7 @@ struct Product {
 pub fn begin_login() -> PendingLogin {
     let start_url = login_url();
     PendingLogin {
+        page_text_url_prefixes: vec![],
         store: StoreId::Gog,
         start_url: start_url.clone(),
         done_url_prefixes: vec![DONE_PREFIX.to_string()],
@@ -152,7 +170,7 @@ pub async fn complete_login(
         ("redirect_uri", REDIRECT_URI),
     ]))
     .await
-    .map_err(|err| eyre::format_err!("Could not finish the GOG sign-in: {err}"))?;
+    .wrap_err("Could not finish the GOG sign-in")?;
     let gog = session_from_token(token, now_unix());
     // The name is only for display; a failure here should not fail the login.
     let account_name = fetch_username(client, &gog).await.ok().flatten();
@@ -162,12 +180,15 @@ pub async fn complete_login(
     })
 }
 
-pub async fn fetch_owned(client: &Client, session: &mut Session) -> eyre::Result<Vec<OwnedGame>> {
-    let mut gog = read_session(session)?;
+pub async fn fetch_owned(
+    client: &Client,
+    session: &mut Session,
+    fetch: &mut Fetch<'_>,
+) -> eyre::Result<Vec<OwnedGame>> {
+    let mut gog: GogSession = session_data(StoreId::Gog, session)?;
     let mut renewed = false;
     if needs_refresh(&gog, now_unix()) {
-        gog = refresh(client, &gog).await?;
-        session.data = serde_json::to_value(&gog)?;
+        gog = renew(client, &gog, session, fetch).await?;
         renewed = true;
     }
     if session.account_name.is_none() {
@@ -176,8 +197,7 @@ pub async fn fetch_owned(client: &Client, session: &mut Session) -> eyre::Result
     let games = match fetch_products(client, &gog).await {
         // GOG can end a token before it expires: renew it once and try again.
         Err(err) if !renewed && http::is_login_rejected(&err) => {
-            gog = refresh(client, &gog).await?;
-            session.data = serde_json::to_value(&gog)?;
+            gog = renew(client, &gog, session, fetch).await?;
             fetch_products(client, &gog).await
         }
         result => result,
@@ -185,34 +205,36 @@ pub async fn fetch_owned(client: &Client, session: &mut Session) -> eyre::Result
     games.wrap_err("Could not load the GOG library")
 }
 
+/// Renews the tokens and saves them right away: GOG ends the old refresh token when it is
+/// used, so the new one must not be lost when BoilR is closed while the games are listed.
+async fn renew(
+    client: &Client,
+    gog: &GogSession,
+    session: &mut Session,
+    fetch: &mut Fetch<'_>,
+) -> eyre::Result<GogSession> {
+    let renewed = refresh(client, gog).await?;
+    session.data = serde_json::to_value(&renewed)?;
+    fetch.checkpoint(session)?;
+    Ok(renewed)
+}
+
 async fn fetch_products(client: &Client, gog: &GogSession) -> eyre::Result<Vec<OwnedGame>> {
-    let mut games = Vec::new();
-    let mut page = 1;
-    loop {
-        let body = http::send(
+    http::paginate("GOG", 1u32, MAX_PAGES, |page| async move {
+        let response = http::send(
             client
                 .get(PRODUCTS_URL)
                 .bearer_auth(&gog.access_token)
                 .query(&[("mediaType", "1"), ("page", &page.to_string())]),
         )
-        .await?
-        .text()
-        .await
-        .map_err(http::request_failed)?;
-        let response = parse_products_page(&body)?;
-        games.extend(games_from_page(&response));
-        match next_page(&response, page) {
-            Some(next) if next <= MAX_PAGES => page = next,
-            _ => break,
-        }
-    }
-    Ok(games)
-}
-
-fn read_session(session: &Session) -> eyre::Result<GogSession> {
-    serde_json::from_value(session.data.clone()).map_err(|err| {
-        eyre::format_err!("The saved GOG login is unreadable ({err}). Sign in again.")
+        .await?;
+        // Where the request ended up after redirects. Reading the body takes the response.
+        let final_url = response.url().clone();
+        let body = response.text().await.map_err(http::request_failed)?;
+        let products = parse_products_page(&final_url, &body)?;
+        Ok((games_from_page(&products), next_page(&products, page)))
     })
+    .await
 }
 
 async fn refresh(client: &Client, gog: &GogSession) -> eyre::Result<GogSession> {
@@ -223,10 +245,27 @@ async fn refresh(client: &Client, gog: &GogSession) -> eyre::Result<GogSession> 
         ("refresh_token", gog.refresh_token.as_str()),
     ]))
     .await
-    .map_err(|err| {
-        http::login_rejected(format!("The GOG login has expired; sign in again. ({err})"))
-    })?;
+    .map_err(refresh_failure)?;
     Ok(session_from_token(token, now_unix()))
+}
+
+/// Whether a failed token renewal means GOG refused the refresh token. The token service
+/// answers a token it no longer accepts with HTTP 400 (`invalid_grant`) or 401. Anything
+/// else (no connection, a timeout, a rate limit, 5xx) says nothing about the login.
+fn refresh_was_refused(status: Option<u16>) -> bool {
+    matches!(status, Some(400 | 401))
+}
+
+/// A failed token renewal as the error to report: a rejected login only when GOG refused
+/// the refresh token, otherwise the error as it is, with context.
+fn refresh_failure(err: eyre::Report) -> eyre::Report {
+    if refresh_was_refused(http::status_of(&err)) {
+        http::login_rejected(format!(
+            "GOG no longer accepts the saved login. Sign in again. ({err})"
+        ))
+    } else {
+        err.wrap_err("Could not renew the GOG login")
+    }
 }
 
 async fn fetch_username(client: &Client, gog: &GogSession) -> eyre::Result<Option<String>> {
@@ -303,19 +342,57 @@ fn code_from_capture(capture: &LoginCapture) -> eyre::Result<String> {
     ))
 }
 
-/// Without a valid token GOG redirects the library request to its sign-in web page.
-fn parse_products_page(body: &str) -> eyre::Result<ProductsPage> {
+/// Reads one page of the library. `final_url` is where the request ended up after redirects.
+///
+/// Without a valid token GOG sends its sign-in page instead of the library; only that is a
+/// rejected login. Any other answer that is not a page of the library (a captive portal, a
+/// maintenance page, JSON without `products`) is an error that says nothing about the login.
+fn parse_products_page(final_url: &url::Url, body: &str) -> eyre::Result<ProductsPage> {
     if body.trim_start().starts_with('<') {
-        return Err(http::login_rejected(
-            "GOG did not accept the saved login (it sent a web page instead of the library). Sign in again.",
+        if is_sign_in_page(final_url, body) {
+            return Err(http::login_rejected(
+                "GOG did not accept the saved login (it sent its sign-in page instead of the library). Sign in again.",
+            ));
+        }
+        return Err(eyre::format_err!(
+            "Unexpected answer from GOG: a web page from {} instead of the library. Body starts with: {}",
+            http::without_query(final_url),
+            http::snippet(body)
         ));
     }
     serde_json::from_str(body).map_err(|err| {
         eyre::format_err!(
-            "Unexpected GOG library response: {err}. Body starts with: {}",
+            "Unexpected answer from GOG instead of the library: {err}. Body starts with: {}",
             http::snippet(body)
         )
     })
+}
+
+/// Whether a web page that came instead of the library is GOG's sign-in page.
+///
+/// It is when GOG itself served it (HTTPS on a `gog.com` host: a captive portal or a proxy's
+/// error page is not) and it is a login page: the request was redirected to GOG's login
+/// host, to a login path, or to the store with `#openlogin` (which opens the sign-in form),
+/// or the page is nothing but a refresh that sends the browser there.
+fn is_sign_in_page(final_url: &url::Url, body: &str) -> bool {
+    let host = final_url
+        .host_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if final_url.scheme() != "https" || !http::domain_matches("gog.com", &host) {
+        return false;
+    }
+    let opens_login = |text: &str| text.to_ascii_lowercase().contains("openlogin");
+    let body = body.to_ascii_lowercase();
+    matches!(host.as_str(), "login.gog.com" | "auth.gog.com")
+        || final_url.path().split('/').any(|segment| {
+            matches!(
+                segment.to_ascii_lowercase().as_str(),
+                "login" | "signin" | "sign-in" | "sign_in"
+            )
+        })
+        || final_url.fragment().is_some_and(opens_login)
+        || (body.contains("http-equiv") && body.contains("refresh") && opens_login(&body))
 }
 
 fn games_from_page(page: &ProductsPage) -> Vec<OwnedGame> {
@@ -323,7 +400,7 @@ fn games_from_page(page: &ProductsPage) -> Vec<OwnedGame> {
         .iter()
         .filter(|p| is_owned_game(p))
         .map(|p| {
-            let game = OwnedGame::new(StoreId::Gog, p.id.clone(), p.title.trim());
+            let game = OwnedGame::new(StoreId::Gog, p.id.clone(), clean_title(&p.title));
             match p.slug.as_deref().map(str::trim) {
                 Some(slug) if !slug.is_empty() => game.with_extra("slug", slug),
                 _ => game,
@@ -334,17 +411,23 @@ fn games_from_page(page: &ProductsPage) -> Vec<OwnedGame> {
 
 fn is_owned_game(product: &Product) -> bool {
     !product.id.is_empty()
-        && !product.title.trim().is_empty()
+        && !clean_title(&product.title).is_empty()
         && product.is_movie != Some(true)
         && product.is_game != Some(false)
         && product.is_base_product_missing != Some(true)
         && !NOT_GAMES.contains(&product.id.as_str())
 }
 
-/// The page to fetch after `current`, if any.
+/// The page to ask for after page `current`, or `None` when that was the last one.
+///
+/// An empty page always ends the list. When GOG does not say how many pages there are
+/// (`totalPages` missing or 0) but the page has products, the next page is asked for until
+/// an empty one comes: stopping there could save a list cut short.
 fn next_page(page: &ProductsPage, current: u32) -> Option<u32> {
-    let current = current.max(page.page);
-    (!page.products.is_empty() && current < page.total_pages).then_some(current + 1)
+    if page.products.is_empty() {
+        return None;
+    }
+    (page.total_pages == 0 || current < page.total_pages).then_some(current.saturating_add(1))
 }
 
 /// GOG sends ids as numbers in some responses and as strings in others.
@@ -382,6 +465,21 @@ mod tests {
             pasted: Some(text.to_string()),
             ..Default::default()
         }
+    }
+
+    /// Where a library request ends up when GOG answers it without a redirect.
+    fn library_url() -> eyre::Result<url::Url> {
+        Ok(url::Url::parse(&format!(
+            "{PRODUCTS_URL}?mediaType=1&page=1"
+        ))?)
+    }
+
+    fn status(status: u16) -> eyre::Report {
+        eyre::Report::new(http::HttpStatus {
+            status,
+            url: TOKEN_URL.into(),
+            body: r#"{"error":"invalid_grant"}"#.into(),
+        })
     }
 
     #[test]
@@ -449,7 +547,17 @@ mod tests {
             account_name: None,
             data: serde_json::to_value(&gog)?,
         };
-        assert_eq!(read_session(&session)?, gog);
+        assert_eq!(session_data::<GogSession>(StoreId::Gog, &session)?, gog);
+        Ok(())
+    }
+
+    #[test]
+    fn debug_output_hides_the_tokens() -> eyre::Result<()> {
+        let token: TokenResponse = serde_json::from_str(TOKEN)?;
+        let shown = format!("{:?}", session_from_token(token, 1_000));
+        assert!(!shown.contains("access-1"), "{shown}");
+        assert!(!shown.contains("refresh-1"), "{shown}");
+        assert!(shown.contains("48628349957132247"), "{shown}");
         Ok(())
     }
 
@@ -468,7 +576,43 @@ mod tests {
             account_name: None,
             data: serde_json::json!({"cookies": []}),
         };
-        assert!(read_session(&session).is_err_and(|e| e.to_string().contains("Sign in again")));
+        let result = session_data::<GogSession>(StoreId::Gog, &session);
+        assert!(result.is_err_and(|e| {
+            http::is_login_rejected(&e) && e.to_string().contains("Sign in again")
+        }));
+    }
+
+    #[test]
+    fn only_a_refused_refresh_token_is_a_rejected_login() {
+        // GOG answers a refresh token it no longer accepts with 400 `invalid_grant`.
+        assert!(refresh_was_refused(Some(400)));
+        assert!(refresh_was_refused(Some(401)));
+        // Blocked, rate limited, down, or no answer at all: the login may be fine.
+        for other in [403, 404, 408, 429, 500, 502, 503] {
+            assert!(!refresh_was_refused(Some(other)), "{other}");
+        }
+        assert!(!refresh_was_refused(None));
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_its_kind() {
+        for refused in [400, 401] {
+            let err = refresh_failure(status(refused));
+            assert!(http::is_login_rejected(&err), "{refused}");
+            assert!(err.to_string().contains("Sign in again"), "{err}");
+        }
+        // An outage stays an outage, with the status still there to read.
+        let outage = refresh_failure(status(503));
+        assert!(!http::is_login_rejected(&outage));
+        assert!(http::is_transient(&outage));
+        assert_eq!(http::status_of(&outage), Some(503));
+        assert!(format!("{outage:#}").contains("Could not renew the GOG login"));
+        // No connection: transient, and not a reason to sign in again.
+        let offline = refresh_failure(http::transient("no connection"));
+        assert!(http::is_transient(&offline) && !http::is_login_rejected(&offline));
+        // A bot block is neither.
+        let blocked = refresh_failure(status(403));
+        assert!(!http::is_login_rejected(&blocked) && !http::is_transient(&blocked));
     }
 
     #[test]
@@ -496,9 +640,34 @@ mod tests {
     }
 
     #[test]
+    fn titles_lose_trademark_signs_and_extra_spaces() -> eyre::Result<()> {
+        let page: ProductsPage = serde_json::from_str(
+            r#"{"totalPages":1,"products":[
+                {"id":1,"title":"  The Witcher\u00ae 3:  Wild Hunt\u2122 "},
+                {"id":2,"title":" \u2122 "}
+            ]}"#,
+        )?;
+        let games = games_from_page(&page);
+        let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
+        // A title that is only a sign is no title.
+        assert_eq!(titles, vec!["The Witcher 3: Wild Hunt"]);
+
+        let first: ProductsPage = serde_json::from_str(PAGE_1)?;
+        let witcher = games_from_page(&first)
+            .into_iter()
+            .find(|g| g.id == "1207664663");
+        assert_eq!(
+            witcher.map(|g| g.title),
+            Some("The Witcher: Enhanced Edition".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn follows_pages_until_the_last() -> eyre::Result<()> {
-        let first = parse_products_page(PAGE_1)?;
-        let second = parse_products_page(PAGE_2)?;
+        let url = library_url()?;
+        let first = parse_products_page(&url, PAGE_1)?;
+        let second = parse_products_page(&url, PAGE_2)?;
         assert_eq!(next_page(&first, 1), Some(2));
         assert_eq!(next_page(&second, 2), None);
         assert_eq!(games_from_page(&second).len(), 1);
@@ -516,9 +685,108 @@ mod tests {
     }
 
     #[test]
-    fn sign_in_page_instead_of_library_asks_to_sign_in_again() {
-        let html = "<!DOCTYPE html>\n<html><head><meta http-equiv=\"refresh\" content=\"0;url='/en##openlogin'\" /></head></html>";
-        assert!(parse_products_page(html).is_err_and(|e| e.to_string().contains("Sign in again")));
-        assert!(parse_products_page("{\"products\": 3}").is_err());
+    fn asks_for_more_pages_while_gog_does_not_say_how_many_there_are() -> eyre::Result<()> {
+        let url = library_url()?;
+        // No `totalPages`, or 0, on a page with products: not the end of the list.
+        let unknown = parse_products_page(&url, r#"{"products":[{"id":1,"title":"A"}]}"#)?;
+        assert_eq!(next_page(&unknown, 1), Some(2));
+        assert_eq!(next_page(&unknown, 7), Some(8));
+        let zero = parse_products_page(
+            &url,
+            r#"{"totalPages":0,"products":[{"id":1,"title":"A"}]}"#,
+        )?;
+        assert_eq!(next_page(&zero, 3), Some(4));
+        // The empty page that follows is the end.
+        let end = parse_products_page(&url, r#"{"products":[]}"#)?;
+        assert_eq!(next_page(&end, 2), None);
+        // The page asked for decides, also when it is past what GOG reports.
+        let first = parse_products_page(&url, PAGE_1)?;
+        assert_eq!(next_page(&first, 2), None);
+        assert_eq!(next_page(&first, u32::MAX), None);
+        assert_eq!(next_page(&unknown, u32::MAX), Some(u32::MAX));
+        Ok(())
+    }
+
+    #[test]
+    fn an_answer_without_products_is_not_an_empty_library() -> eyre::Result<()> {
+        let url = library_url()?;
+        for body in [
+            "{}",
+            r#"{"page":1,"totalPages":3}"#,
+            r#"{"error":"temporarily unavailable"}"#,
+            r#"{"products": 3}"#,
+            r#"{"products": null}"#,
+            "[]",
+            "",
+        ] {
+            let result = parse_products_page(&url, body);
+            assert!(
+                result.is_err_and(|e| {
+                    e.to_string().contains("Unexpected answer")
+                        && !http::is_login_rejected(&e)
+                        && !http::is_transient(&e)
+                }),
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_gogs_sign_in_page_asks_to_sign_in_again() -> eyre::Result<()> {
+        let page = "<!DOCTYPE html>\n<html><body>Something else</body></html>";
+        let rejected = |url: &str, body: &str| -> eyre::Result<bool> {
+            let result = parse_products_page(&url::Url::parse(url)?, body);
+            let Err(err) = result else {
+                eyre::bail!("a web page was read as a library page");
+            };
+            Ok(http::is_login_rejected(&err))
+        };
+
+        // The request was redirected to GOG's login.
+        for url in [
+            "https://login.gog.com/auth?client_id=1&redirect_uri=x",
+            "https://auth.gog.com/auth?client_id=1",
+            "https://www.gog.com/en/login?next=x",
+            "https://www.gog.com/##openlogin",
+            "https://www.gog.com/en##openlogin",
+        ] {
+            assert!(rejected(url, page)?, "{url}");
+        }
+        // GOG answered with a page that opens its login.
+        let opens_login = "<!DOCTYPE html>\n<html><head><meta http-equiv=\"refresh\" content=\"0;url='/en##openlogin'\" /></head></html>";
+        assert!(rejected(library_url()?.as_str(), opens_login)?);
+
+        // Any other page says nothing about the login: a maintenance page of GOG's, a
+        // captive portal, a proxy's error page, also when it mentions a login.
+        assert!(!rejected(library_url()?.as_str(), page)?);
+        assert!(!rejected("https://www.gog.com/en/maintenance", page)?);
+        let mentions_login =
+            "<html><script>if (hash == 'openlogin') show()</script>Down for maintenance</html>";
+        assert!(!rejected(
+            "https://www.gog.com/en/maintenance",
+            mentions_login
+        )?);
+        for url in [
+            "http://hotel-wifi.example/login",
+            "https://portal.example/login?next=https://embed.gog.com/",
+            "https://notgog.com/login",
+            "https://gog.com.example/login",
+            "http://login.gog.com/login",
+        ] {
+            assert!(!rejected(url, page)?, "{url}");
+            assert!(!rejected(url, opens_login)?, "{url}");
+        }
+        let err = parse_products_page(
+            &url::Url::parse("https://portal.example/a?token=SECRET")?,
+            page,
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(err.contains("Unexpected answer"), "{err}");
+        assert!(err.contains("https://portal.example/a"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+        Ok(())
     }
 }

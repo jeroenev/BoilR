@@ -4,14 +4,20 @@
     "title": "Fortnite",
     "namespace": "ns-fortnite",
     "categories": [{"path": "games"}, {"path": "applications"}],
-    "customAttributes": {"CanRunOffline": {"type": "STRING", "value": "false"}},
+    "customAttributes": {
+      "CanRunOffline": {"type": "STRING", "value": "false"},
+      "com.epicgames.app.productSlug": {"type": "STRING", "value": "fortnite"}
+    },
     "mainGameItem": null
   },
   "cat-control": {
     "id": "cat-control",
     "title": "Control™ Ultimate Edition",
     "namespace": "ns-control",
-    "categories": [{"path": "public"}, {"path": "games"}, {"path": "applications"}]
+    "categories": [{"path": "public"}, {"path": "games"}, {"path": "applications"}],
+    "customAttributes": {
+      "com.epicgames.app.productSlug": {"type": "STRING", "value": "control/home"}
+    }
   },
   "cat-control-dlc": {
     "id": "cat-control-dlc",

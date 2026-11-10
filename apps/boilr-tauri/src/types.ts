@@ -197,6 +197,8 @@ export type StoreAccount = {
   code_name: string;
   enabled: boolean;
   install_with: InstallWith;
+  /** Whether "Heroic first" is a choice on this computer (Heroic installs games on Linux only). */
+  heroic_available: boolean;
   /** About the action that returned this account: a sign-out the store could not be told
    * about, or a first library fetch that failed. */
   notice?: string;

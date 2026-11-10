@@ -17,10 +17,14 @@
 //! - `sku`: the product SKU, when the service sends one.
 //! - `icon_url`: square product art, when the service sends one.
 
-use reqwest::{header, Client};
+use eyre::WrapErr;
+use reqwest::{header, Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 
-use crate::{http, LoginCapture, ManualLogin, OwnedGame, PendingLogin, Session, StoreId};
+use crate::{
+    clean_title, http, session_data, Fetch, LoginCapture, ManualLogin, OwnedGame, PendingLogin,
+    Session, StoreId,
+};
 
 const SIGN_IN_URL: &str = "https://www.amazon.com/ap/signin";
 const RETURN_TO: &str = "https://www.amazon.com";
@@ -46,19 +50,44 @@ const CODE_PARAM: &str = "openid.oa2.authorization_code";
 const SKIPPED_PRODUCT_LINE: &str = "Twitch:FuelEntitlement";
 /// Refresh this many seconds before the access token runs out.
 const EXPIRY_MARGIN_SECS: u64 = 120;
-/// Stops a misbehaving `nextToken` from looping forever.
+/// More pages than this is taken as a `nextToken` that never ends: an error, not the end of
+/// the list.
 const MAX_PAGES: usize = 200;
+/// The shortest pasted value that is taken as a bare authorization code. A guess on the
+/// safe side: the codes in Login with Amazon's documentation are 20 characters long.
+const MIN_CODE_CHARS: usize = 10;
+/// Exception names Amazon's services answer a token they do not accept with, in the
+/// `__type` of a JSON error body (`com.amazon.coral.service#UnrecognizedClientException`).
+const AUTH_EXCEPTIONS: [&str; 5] = [
+    "UnrecognizedClientException",
+    "ExpiredTokenException",
+    "InvalidTokenException",
+    "NotAuthorizedException",
+    "AccessDeniedException",
+];
 
 /// State carried from [`begin_login`] to [`complete_login`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LoginState {
     code_verifier: String,
     device_serial: String,
     client_id: String,
 }
 
-/// What [`Session::data`] holds for Amazon.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// The PKCE verifier stays out of `Debug` output.
+impl std::fmt::Debug for LoginState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginState")
+            .field("code_verifier", &"<hidden>")
+            .field("device_serial", &self.device_serial)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+/// What [`Session::data`] holds for Amazon. Sessions saved by earlier builds also hold a
+/// `client_id` and a `user_id`; nothing reads them, so they are dropped on the next save.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AmazonSession {
     pub access_token: String,
     pub refresh_token: String,
@@ -67,9 +96,18 @@ pub struct AmazonSession {
     pub expires_at: u64,
     /// The serial this device was registered with; also the base of `hardwareHash`.
     pub device_serial: String,
-    pub client_id: String,
-    #[serde(default)]
-    pub user_id: Option<String>,
+}
+
+// The tokens stay out of `Debug` output, so a stray `{:?}` cannot put them in a log.
+impl std::fmt::Debug for AmazonSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmazonSession")
+            .field("access_token", &"<hidden>")
+            .field("refresh_token", &"<hidden>")
+            .field("expires_at", &self.expires_at)
+            .field("device_serial", &self.device_serial)
+            .finish()
+    }
 }
 
 impl AmazonSession {
@@ -82,6 +120,7 @@ pub fn begin_login() -> PendingLogin {
     let state = new_login_state();
     let start_url = sign_in_url(&state.client_id, &code_challenge(&state.code_verifier));
     PendingLogin {
+        page_text_url_prefixes: vec![],
         store: StoreId::Amazon,
         start_url: start_url.clone(),
         done_url_prefixes: done_url_prefixes(),
@@ -116,7 +155,8 @@ pub async fn complete_login(
             .header(header::USER_AGENT, AUTH_USER_AGENT)
             .json(&body),
     )
-    .await?;
+    .await
+    .wrap_err("Could not finish the Amazon sign-in")?;
     let (session, account_name) = session_from_registration(response, &state, crate::now_unix())?;
     Ok(Session {
         account_name,
@@ -124,26 +164,38 @@ pub async fn complete_login(
     })
 }
 
-pub async fn fetch_owned(client: &Client, session: &mut Session) -> eyre::Result<Vec<OwnedGame>> {
-    let mut amazon: AmazonSession =
-        serde_json::from_value(session.data.clone()).map_err(|err| {
-            eyre::format_err!("The saved Amazon login can't be read ({err}). Sign in again.")
-        })?;
+pub async fn fetch_owned(
+    client: &Client,
+    session: &mut Session,
+    fetch: &mut Fetch<'_>,
+) -> eyre::Result<Vec<OwnedGame>> {
+    let mut amazon: AmazonSession = session_data(StoreId::Amazon, session)?;
     let mut renewed = false;
     if amazon.needs_refresh(crate::now_unix()) {
-        refresh(client, &mut amazon).await?;
-        session.data = serde_json::to_value(&amazon)?;
+        renew(client, &mut amazon, session, fetch).await?;
         renewed = true;
     }
     match fetch_entitlements(client, &amazon).await {
         // Amazon can end a token before it expires: renew it once and try again.
         Err(err) if !renewed && http::is_login_rejected(&err) => {
-            refresh(client, &mut amazon).await?;
-            session.data = serde_json::to_value(&amazon)?;
+            renew(client, &mut amazon, session, fetch).await?;
             fetch_entitlements(client, &amazon).await
         }
         result => result,
     }
+}
+
+/// Renews the access token and saves the session right away, so the renewal is not lost
+/// when BoilR is closed while the games are listed.
+async fn renew(
+    client: &Client,
+    amazon: &mut AmazonSession,
+    session: &mut Session,
+    fetch: &mut Fetch<'_>,
+) -> eyre::Result<()> {
+    refresh(client, amazon).await?;
+    session.data = serde_json::to_value(&*amazon)?;
+    fetch.checkpoint(session)
 }
 
 async fn fetch_entitlements(
@@ -151,11 +203,12 @@ async fn fetch_entitlements(
     amazon: &AmazonSession,
 ) -> eyre::Result<Vec<OwnedGame>> {
     let hardware_hash = hardware_hash(&amazon.device_serial);
-    let mut entitlements = vec![];
-    let mut next_token: Option<String> = None;
-    for _ in 0..MAX_PAGES {
-        let body = entitlements_request(&hardware_hash, next_token.as_deref());
-        let response: EntitlementsResponse = http::send_json(
+    let hardware_hash = hardware_hash.as_str();
+    // The cursor is the `nextToken` of the page before; the first page has none.
+    let first_page: Option<String> = None;
+    let entitlements = http::paginate("Amazon", first_page, MAX_PAGES, |next_token| async move {
+        let body = entitlements_request(hardware_hash, next_token.as_deref());
+        let response = send_entitlements_request(
             client
                 .post(ENTITLEMENTS_URL)
                 .header(header::USER_AGENT, LAUNCHER_USER_AGENT)
@@ -166,22 +219,29 @@ async fn fetch_entitlements(
         )
         .await?;
         let page = entitlements_page(response)?;
-        entitlements.extend(page.entitlements);
-        match page.next_token {
-            Some(token) if next_token.as_deref() != Some(token.as_str()) => {
-                next_token = Some(token)
-            }
-            _ => return Ok(owned_games(entitlements)),
-        }
+        Ok((page.entitlements, page.next_token.map(Some)))
+    })
+    .await?;
+    Ok(owned_games(entitlements))
+}
+
+/// Sends a GetEntitlements request. A failed one is looked at as a whole (status and body),
+/// because Amazon answers a token it does not accept with 400 or 403 as well as with 401.
+async fn send_entitlements_request(request: RequestBuilder) -> eyre::Result<EntitlementsResponse> {
+    let response = request.send().await.map_err(http::request_failed)?;
+    let status = response.status();
+    if status.is_success() {
+        return http::read_json(response).await;
     }
-    Err(eyre::format_err!(
-        "Amazon kept sending more pages of games after {MAX_PAGES} pages; giving up."
-    ))
+    let url = http::without_query(response.url());
+    // The whole body, not the snippet of an error message: that one may be cut off.
+    let body = response.text().await.unwrap_or_default();
+    Err(entitlements_failure(status.as_u16(), url, &body))
 }
 
 /// Removes BoilR from the account's registered devices, as nile does when it logs out.
 pub async fn sign_out(client: &Client, session: &Session) -> eyre::Result<()> {
-    let mut amazon: AmazonSession = serde_json::from_value(session.data.clone())?;
+    let mut amazon: AmazonSession = session_data(StoreId::Amazon, session)?;
     if amazon.needs_refresh(crate::now_unix()) {
         refresh(client, &mut amazon).await?;
     }
@@ -200,8 +260,8 @@ pub async fn sign_out(client: &Client, session: &Session) -> eyre::Result<()> {
 
 async fn refresh(client: &Client, session: &mut AmazonSession) -> eyre::Result<()> {
     if session.refresh_token.is_empty() {
-        return Err(eyre::format_err!(
-            "The saved Amazon login has no refresh token. Sign in again."
+        return Err(http::login_rejected(
+            "The saved Amazon login has no refresh token. Sign in again.",
         ));
     }
     let body = RefreshRequest {
@@ -218,8 +278,77 @@ async fn refresh(client: &Client, session: &mut AmazonSession) -> eyre::Result<(
             .json(&body),
     )
     .await
-    .map_err(|err| err.wrap_err("Could not refresh the Amazon login"))?;
+    .map_err(refresh_failure)?;
     apply_refresh(session, response, crate::now_unix())
+}
+
+// ---------------------------------------------------------------------------------------
+// Which answers mean "the login was refused" (pure)
+// ---------------------------------------------------------------------------------------
+
+/// Whether a failed token renewal means Amazon refused the refresh token. The token service
+/// answers one it no longer accepts the OAuth way, with HTTP 400 (`invalid_grant`) or 401.
+/// Anything else (no connection, a timeout, a rate limit, 5xx) says nothing about the login.
+fn refresh_was_refused(status: Option<u16>) -> bool {
+    matches!(status, Some(400 | 401))
+}
+
+/// A failed token renewal as the error to report: a rejected login only when Amazon refused
+/// the refresh token, otherwise the error as it is, with context.
+fn refresh_failure(err: eyre::Report) -> eyre::Report {
+    if refresh_was_refused(http::status_of(&err)) {
+        http::login_rejected(format!(
+            "Amazon no longer accepts the saved login. Sign in again. ({err})"
+        ))
+    } else {
+        err.wrap_err("Could not refresh the Amazon login")
+    }
+}
+
+/// Whether an error's `__type` or `message` names one of the [`AUTH_EXCEPTIONS`].
+fn names_auth_exception(error_type: Option<&str>, message: Option<&str>) -> bool {
+    [error_type, message].into_iter().flatten().any(|text| {
+        let text = text.to_ascii_lowercase();
+        AUTH_EXCEPTIONS
+            .iter()
+            .any(|name| text.contains(&name.to_ascii_lowercase()))
+    })
+}
+
+/// Whether a failed response of Amazon's game services means the access token was refused.
+///
+/// 401 always does. Amazon's services also answer a bad or expired token with 400 or 403,
+/// and then a JSON body names an auth exception. A 400 or 403 without one (a bot block, a
+/// captive portal, a web page) says nothing about the login, and neither does any other
+/// status.
+fn login_was_refused(status: u16, body: &str) -> bool {
+    match status {
+        401 => true,
+        400 | 403 => serde_json::from_str::<serde_json::Value>(body).is_ok_and(|error| {
+            let text = |name: &str| error.get(name).and_then(|value| value.as_str());
+            names_auth_exception(text("__type"), text("message").or(text("Message")))
+        }),
+        _ => false,
+    }
+}
+
+/// The error for a failed GetEntitlements response: a rejected login when Amazon refused
+/// the token (so the token is renewed once and the request tried again), otherwise the
+/// plain HTTP error with its status.
+fn entitlements_failure(status: u16, url: String, body: &str) -> eyre::Report {
+    let failure = eyre::Report::new(http::HttpStatus {
+        status,
+        url,
+        body: http::snippet(body),
+    });
+    // 401 is a rejected login as it is.
+    if status != 401 && login_was_refused(status, body) {
+        http::login_rejected(format!(
+            "Amazon did not accept the saved login. Sign in again. ({failure})"
+        ))
+    } else {
+        failure
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -299,17 +428,20 @@ fn sign_in_url(client_id: &str, challenge: &str) -> String {
 }
 
 /// Amazon sends the browser back to `openid.return_to` with the OpenID response appended:
-/// `https://www.amazon.com/?openid.assoc_handle=amzn_sonic_games_launcher&...`. The sign-in
-/// pages themselves live under `/ap/`, so they never match.
+/// `https://www.amazon.com/?openid.assoc_handle=amzn_sonic_games_launcher&...`. Any query on
+/// the home page counts, whichever parameter comes first; [`authorization_code`] finds the
+/// code wherever it is. The sign-in pages themselves live under `/ap/`, so they never match,
+/// and neither does the home page without a query.
 fn done_url_prefixes() -> Vec<String> {
     vec![
-        "https://www.amazon.com/?openid.".to_string(),
-        "https://amazon.com/?openid.".to_string(),
+        "https://www.amazon.com/?".to_string(),
+        "https://amazon.com/?".to_string(),
     ]
 }
 
 /// The authorization code from the redirect URL (webview) or from what the user pasted:
-/// the full URL, or the bare code.
+/// the address Amazon sent the browser to, with or without its `https://`, the query of
+/// that address, or the bare code.
 fn authorization_code(capture: &LoginCapture) -> eyre::Result<String> {
     let raw = capture
         .final_url
@@ -319,25 +451,47 @@ fn authorization_code(capture: &LoginCapture) -> eyre::Result<String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| eyre::format_err!("The Amazon sign-in did not return anything."))?;
 
-    if raw.contains("://") {
-        if let Some(code) = http::query_param(raw, CODE_PARAM).filter(|c| !c.is_empty()) {
-            return Ok(code);
-        }
-        if http::query_param(raw, "openid.mode").as_deref() == Some("cancel") {
-            return Err(eyre::format_err!("The Amazon sign-in was cancelled."));
+    let query = match raw.split_once('?') {
+        Some((_, query)) => Some(query),
+        None if raw.contains('=') => Some(raw),
+        None => None,
+    };
+    let Some(query) = query else {
+        if looks_like_code(raw) {
+            return Ok(raw.to_string());
         }
         return Err(eyre::format_err!(
-            "That address has no Amazon sign-in code ({CODE_PARAM}). Sign in again and copy \
-             the full address the browser lands on after signing in."
+            "That does not look like the address Amazon sent you to. Sign in, then paste the \
+             full address from the browser's address bar."
         ));
+    };
+    let query = query.split('#').next().unwrap_or_default();
+    let param = |name: &str| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(code) = param(CODE_PARAM) {
+        return Ok(code);
     }
-    if raw.contains(char::is_whitespace) || raw.contains('?') || raw.contains('&') {
-        return Err(eyre::format_err!(
-            "That does not look like the address Amazon sent you to. Paste the full address \
-             from the browser's address bar."
-        ));
+    if param("openid.mode").as_deref() == Some("cancel") {
+        return Err(eyre::format_err!("The Amazon sign-in was cancelled."));
     }
-    Ok(raw.to_string())
+    Err(eyre::format_err!(
+        "That address has no Amazon sign-in code ({CODE_PARAM}). Sign in again and copy \
+         the full address the browser lands on after signing in."
+    ))
+}
+
+/// Whether a pasted value without a query can be an authorization code on its own: long
+/// enough, and made of the characters a code has. An address without its query
+/// (`www.amazon.com/`) has dots or slashes and is not one.
+fn looks_like_code(value: &str) -> bool {
+    value.len() >= MIN_CODE_CHARS
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
 #[derive(Serialize)]
@@ -397,12 +551,13 @@ fn register_request<'a>(code: &'a str, state: &'a LoginState) -> RegisterRequest
     }
 }
 
-#[derive(Debug, Deserialize)]
+// The registration response holds tokens, so the types it is read into have no `Debug`.
+#[derive(Deserialize)]
 struct RegisterResponse {
     response: Option<RegisterResponseBody>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RegisterResponseBody {
     success: Option<RegisterSuccess>,
     error: Option<AmazonError>,
@@ -414,21 +569,19 @@ struct AmazonError {
     message: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RegisterSuccess {
     tokens: RegisterTokens,
     #[serde(default)]
     extensions: Option<RegisterExtensions>,
-    #[serde(default)]
-    customer_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RegisterTokens {
     bearer: BearerToken,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct BearerToken {
     access_token: String,
     refresh_token: String,
@@ -446,7 +599,6 @@ struct RegisterExtensions {
 
 #[derive(Debug, Deserialize)]
 struct CustomerInfo {
-    user_id: Option<String>,
     name: Option<String>,
     given_name: Option<String>,
 }
@@ -519,22 +671,16 @@ fn session_from_registration(
         .and_then(|d| d.device_serial_number)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| state.device_serial.clone());
-    let (user_id, account_name) = match customer {
-        Some(c) => (
-            c.user_id,
-            c.name
-                .filter(|n| !n.trim().is_empty())
-                .or(c.given_name.filter(|n| !n.trim().is_empty())),
-        ),
-        None => (None, None),
-    };
+    let account_name = customer.and_then(|c| {
+        c.name
+            .filter(|n| !n.trim().is_empty())
+            .or(c.given_name.filter(|n| !n.trim().is_empty()))
+    });
     let session = AmazonSession {
         expires_at: expires_at(bearer.expires_in.as_ref(), now),
         access_token: bearer.access_token,
         refresh_token: bearer.refresh_token,
         device_serial,
-        client_id: state.client_id.clone(),
-        user_id: user_id.or(success.customer_id),
     };
     Ok((session, account_name))
 }
@@ -548,7 +694,8 @@ struct RefreshRequest<'a> {
     app_version: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
+/// Holds a token, so it has no `Debug`.
+#[derive(Deserialize)]
 struct RefreshResponse {
     access_token: Option<String>,
     #[serde(default)]
@@ -564,19 +711,20 @@ fn apply_refresh(
     response: RefreshResponse,
     now: u64,
 ) -> eyre::Result<()> {
-    match response.access_token.filter(|t| !t.is_empty()) {
-        Some(token) => {
-            session.access_token = token;
-            session.expires_at = expires_at(response.expires_in.as_ref(), now);
-            Ok(())
-        }
-        None => Err(http::login_rejected(format!(
-            "Amazon did not refresh the login ({}). Sign in again.",
-            response
-                .error_description
-                .or(response.error)
-                .unwrap_or_else(|| "no access token in the response".into())
+    if let Some(token) = response.access_token.filter(|t| !t.is_empty()) {
+        session.access_token = token;
+        session.expires_at = expires_at(response.expires_in.as_ref(), now);
+        return Ok(());
+    }
+    match response.error_description.or(response.error) {
+        // Amazon said why it gives no token: it refused the refresh token.
+        Some(reason) => Err(http::login_rejected(format!(
+            "Amazon did not refresh the login ({reason}). Sign in again."
         ))),
+        // An answer that is neither a token nor a refusal says nothing about the login.
+        None => Err(eyre::format_err!(
+            "Unexpected answer from Amazon when refreshing the login: no access token in it."
+        )),
     }
 }
 
@@ -653,20 +801,29 @@ struct EntitlementsPage {
 }
 
 fn entitlements_page(response: EntitlementsResponse) -> eyre::Result<EntitlementsPage> {
-    match response.entitlements {
-        Some(entitlements) => Ok(EntitlementsPage {
-            entitlements,
-            next_token: response.next_token.filter(|t| !t.is_empty()),
-        }),
-        None => Err(eyre::format_err!(
-            "Amazon did not send the list of games: {}{}",
+    let Some(entitlements) = response.entitlements else {
+        let refused =
+            names_auth_exception(response.error_type.as_deref(), response.message.as_deref());
+        let reason = format!(
+            "{}{}",
             response
                 .error_type
                 .map(|t| format!("{t}: "))
                 .unwrap_or_default(),
             response.message.unwrap_or_else(|| "no reason given".into())
-        )),
-    }
+        );
+        return Err(if refused {
+            http::login_rejected(format!(
+                "Amazon did not accept the saved login ({reason}). Sign in again."
+            ))
+        } else {
+            eyre::format_err!("Amazon did not send the list of games: {reason}")
+        });
+    };
+    Ok(EntitlementsPage {
+        entitlements,
+        next_token: response.next_token.filter(|t| !t.is_empty()),
+    })
 }
 
 /// Games from entitlements: skips in-game loot and entries without a product id or title,
@@ -686,7 +843,7 @@ fn owned_games(entitlements: Vec<Entitlement>) -> Vec<OwnedGame> {
         };
         let Some(title) = product
             .title
-            .map(|t| t.trim().to_string())
+            .map(|t| clean_title(&t))
             .filter(|t| !t.is_empty())
         else {
             continue;
@@ -730,6 +887,26 @@ mod tests {
             final_url: Some(url.into()),
             ..Default::default()
         }
+    }
+
+    fn capture_paste(text: &str) -> LoginCapture {
+        LoginCapture {
+            pasted: Some(text.into()),
+            ..Default::default()
+        }
+    }
+
+    /// An error body as Amazon's services send it.
+    fn exception(name: &str) -> String {
+        format!(r#"{{"__type":"com.amazon.coral.service#{name}","message":"Invalid token"}}"#)
+    }
+
+    fn status(status: u16) -> eyre::Report {
+        eyre::Report::new(http::HttpStatus {
+            status,
+            url: TOKEN_URL.into(),
+            body: r#"{"error":"invalid_grant"}"#.into(),
+        })
     }
 
     #[test]
@@ -824,8 +1001,21 @@ mod tests {
         assert!(!matches("https://www.amazon.com/ap/mfa?arb=x"));
         assert!(!matches("https://www.amazon.com/ap/cvf/request?arb=x"));
         assert!(!matches("https://www.amazon.com/"));
+        assert!(!matches(
+            "https://www.amazon.com/gp/help/customer/display.html?nodeId=1"
+        ));
+        assert!(!matches(
+            "https://www.amazon.com.example/?openid.mode=id_res"
+        ));
         assert!(matches(
             "https://www.amazon.com/?openid.assoc_handle=amzn_sonic_games_launcher&openid.oa2.authorization_code=ANabc"
+        ));
+        // Whichever parameter Amazon puts first.
+        assert!(matches(
+            "https://www.amazon.com/?ref_=nav_signin&openid.oa2.authorization_code=ANabc"
+        ));
+        assert!(matches(
+            "https://amazon.com/?language=en_US&openid.oa2.authorization_code=ANabc"
         ));
     }
 
@@ -834,18 +1024,66 @@ mod tests {
         let url = "https://www.amazon.com/?openid.assoc_handle=amzn_sonic_games_launcher\
                    &openid.mode=id_res&openid.oa2.authorization_code=ANcodeXYZ&openid.ns=x";
         assert_eq!(authorization_code(&capture_url(url))?, "ANcodeXYZ");
+        assert_eq!(
+            authorization_code(&capture_paste(&format!("  {url}\n")))?,
+            "ANcodeXYZ"
+        );
+        // The code is found wherever it is in the query.
+        let other_first =
+            "https://www.amazon.com/?ref_=nav&openid.oa2.authorization_code=ANcodeXYZ#top";
+        assert_eq!(authorization_code(&capture_url(other_first))?, "ANcodeXYZ");
+        Ok(())
+    }
 
-        let pasted = LoginCapture {
-            pasted: Some(format!("  {url}\n")),
-            ..Default::default()
-        };
-        assert_eq!(authorization_code(&pasted)?, "ANcodeXYZ");
+    #[test]
+    fn reads_the_code_from_a_pasted_address_without_its_scheme() -> eyre::Result<()> {
+        // Browsers hide the scheme in the address bar, and some copy the address without it.
+        for pasted in [
+            "www.amazon.com/?openid.mode=id_res&openid.oa2.authorization_code=ANcodeXYZ",
+            "amazon.com/?openid.oa2.authorization_code=ANcodeXYZ&openid.ns=x",
+            "?openid.mode=id_res&openid.oa2.authorization_code=ANcodeXYZ",
+            "openid.mode=id_res&openid.oa2.authorization_code=ANcodeXYZ",
+        ] {
+            assert_eq!(
+                authorization_code(&capture_paste(pasted))?,
+                "ANcodeXYZ",
+                "{pasted}"
+            );
+        }
+        Ok(())
+    }
 
-        let bare = LoginCapture {
-            pasted: Some("ANcodeXYZ".into()),
-            ..Default::default()
-        };
-        assert_eq!(authorization_code(&bare)?, "ANcodeXYZ");
+    #[test]
+    fn a_bare_value_is_a_code_only_when_it_looks_like_one() -> eyre::Result<()> {
+        // The length and shape of the codes in Amazon's examples.
+        let code = "ANdNAVhyhqirUelHGEHA";
+        assert_eq!(authorization_code(&capture_paste(code))?, code);
+        assert_eq!(
+            authorization_code(&capture_paste(&format!(" {code}\n")))?,
+            code
+        );
+        assert!(looks_like_code("AN-dNAVhy_hqir"));
+
+        for not_a_code in [
+            // An address without its query, with or without its scheme.
+            "www.amazon.com/",
+            "www.amazon.com",
+            "amazon.com",
+            "https://www.amazon.com/",
+            "https://www.amazon.com/ap/signin",
+            // Too short, or with characters no code has.
+            "ANcode",
+            "not a code at all",
+            "ANdNAVhy|hqirUelHGEHA",
+            "ANdNAVhy/hqirUelHGEHA",
+            "ANdNAVhy.hqirUelHGEHA",
+        ] {
+            let result = authorization_code(&capture_paste(not_a_code));
+            assert!(
+                result.is_err_and(|e| e.to_string().contains("paste the full address")),
+                "{not_a_code}"
+            );
+        }
         Ok(())
     }
 
@@ -854,15 +1092,15 @@ mod tests {
         let cancelled = capture_url("https://www.amazon.com/?openid.mode=cancel");
         let err = authorization_code(&cancelled).map_err(|e| e.to_string());
         assert_eq!(err, Err("The Amazon sign-in was cancelled.".to_string()));
-        assert!(
-            authorization_code(&capture_url("https://www.amazon.com/?openid.mode=id_res")).is_err()
-        );
+        let no_code =
+            authorization_code(&capture_url("https://www.amazon.com/?openid.mode=id_res"));
+        assert!(no_code.is_err_and(|e| e.to_string().contains("no Amazon sign-in code")));
+        let empty_code = authorization_code(&capture_paste(
+            "www.amazon.com/?openid.oa2.authorization_code=&openid.mode=id_res",
+        ));
+        assert!(empty_code.is_err_and(|e| e.to_string().contains("no Amazon sign-in code")));
         assert!(authorization_code(&LoginCapture::default()).is_err());
-        let junk = LoginCapture {
-            pasted: Some("not a code at all".into()),
-            ..Default::default()
-        };
-        assert!(authorization_code(&junk).is_err());
+        assert!(authorization_code(&capture_paste("   ")).is_err());
     }
 
     #[test]
@@ -898,8 +1136,6 @@ mod tests {
         assert_eq!(session.refresh_token, "Atnr|refresh");
         assert_eq!(session.expires_at, 4600);
         assert_eq!(session.device_serial, "SERIALFROMAMAZON");
-        assert_eq!(session.client_id, state().client_id);
-        assert_eq!(session.user_id.as_deref(), Some("amzn1.account.TEST"));
         assert!(!session.needs_refresh(1000));
         assert!(session.needs_refresh(4500));
         Ok(())
@@ -933,13 +1169,137 @@ mod tests {
         let failed: RefreshResponse = serde_json::from_str(
             r#"{"error":"invalid_grant","error_description":"The request has an invalid grant parameter"}"#,
         )?;
-        let err = apply_refresh(&mut session, failed, 0)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(err.contains("invalid grant"), "{err}");
+        let refused = apply_refresh(&mut session, failed, 0);
+        assert!(refused.is_err_and(|e| {
+            http::is_login_rejected(&e) && e.to_string().contains("invalid grant")
+        }));
+        assert_eq!(session.access_token, "Atna|fresh");
+
+        // An answer with neither a token nor a refusal is not a reason to sign in again.
+        for body in ["{}", r#"{"access_token":""}"#, r#"{"token_type":"bearer"}"#] {
+            let odd: RefreshResponse = serde_json::from_str(body)?;
+            let result = apply_refresh(&mut session, odd, 0);
+            assert!(
+                result.is_err_and(|e| {
+                    !http::is_login_rejected(&e) && e.to_string().contains("Unexpected answer")
+                }),
+                "{body}"
+            );
+        }
         assert_eq!(session.access_token, "Atna|fresh");
         Ok(())
+    }
+
+    #[test]
+    fn only_a_refused_refresh_token_is_a_rejected_login() {
+        assert!(refresh_was_refused(Some(400)));
+        assert!(refresh_was_refused(Some(401)));
+        for other in [403, 404, 408, 429, 500, 502, 503] {
+            assert!(!refresh_was_refused(Some(other)), "{other}");
+        }
+        assert!(!refresh_was_refused(None));
+
+        for refused in [400, 401] {
+            let err = refresh_failure(status(refused));
+            assert!(http::is_login_rejected(&err), "{refused}");
+            assert!(err.to_string().contains("Sign in again"), "{err}");
+        }
+        // An outage stays an outage, with the status still there to read.
+        let outage = refresh_failure(status(503));
+        assert!(http::is_transient(&outage) && !http::is_login_rejected(&outage));
+        assert_eq!(http::status_of(&outage), Some(503));
+        assert!(format!("{outage:#}").contains("Could not refresh the Amazon login"));
+        let offline = refresh_failure(http::transient("no connection"));
+        assert!(http::is_transient(&offline) && !http::is_login_rejected(&offline));
+        let blocked = refresh_failure(status(403));
+        assert!(!http::is_login_rejected(&blocked) && !http::is_transient(&blocked));
+    }
+
+    #[test]
+    fn a_refused_token_is_told_from_other_failures() {
+        // 401 is a refused token whatever the body.
+        assert!(login_was_refused(401, ""));
+        assert!(login_was_refused(401, "<html>Unauthorized</html>"));
+        // Amazon's services answer a bad or expired token with 400 or 403 and name why.
+        for name in AUTH_EXCEPTIONS {
+            for status in [400, 403] {
+                assert!(
+                    login_was_refused(status, &exception(name)),
+                    "{status} {name}"
+                );
+            }
+        }
+        // The exception can be named without its namespace, in any case, or in the message.
+        assert!(login_was_refused(
+            400,
+            r#"{"__type":"ExpiredTokenException"}"#
+        ));
+        assert!(login_was_refused(
+            403,
+            r#"{"__type":"x#accessdeniedexception"}"#
+        ));
+        assert!(login_was_refused(
+            400,
+            r#"{"message":"com.amazon.coral.service#InvalidTokenException"}"#
+        ));
+        assert!(login_was_refused(
+            403,
+            r#"{"Message":"NotAuthorizedException: token expired"}"#
+        ));
+
+        // Other errors of the service are not about the login.
+        assert!(!login_was_refused(400, &exception("ValidationException")));
+        assert!(!login_was_refused(400, &exception("ThrottlingException")));
+        assert!(!login_was_refused(403, r#"{"message":"Forbidden"}"#));
+        // A bot block, a captive portal or an empty answer is not either.
+        assert!(!login_was_refused(403, "<html>Request blocked</html>"));
+        assert!(!login_was_refused(403, ""));
+        assert!(!login_was_refused(400, r#"{"__type": 3}"#));
+        assert!(!login_was_refused(
+            400,
+            r#"["UnrecognizedClientException"]"#
+        ));
+        // No other status is, whatever the body says.
+        let named = exception("UnrecognizedClientException");
+        for other in [200, 404, 408, 429, 500, 502, 503] {
+            assert!(!login_was_refused(other, &named), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_refused_token_fails_the_entitlements_call_as_a_rejected_login() {
+        let failure = |status: u16, body: &str| {
+            entitlements_failure(status, ENTITLEMENTS_URL.to_string(), body)
+        };
+        // These make the token be renewed once and the request tried again.
+        for status in [400, 401, 403] {
+            let err = failure(status, &exception("UnrecognizedClientException"));
+            assert!(http::is_login_rejected(&err), "{status}");
+            assert!(err.to_string().contains("Sign in again"), "{err}");
+            assert!(err.to_string().contains(ENTITLEMENTS_URL), "{err}");
+        }
+        assert!(http::is_login_rejected(&failure(401, "")));
+
+        // These do not, and keep their status.
+        let blocked = failure(403, "<html>Request blocked</html>");
+        assert!(!http::is_login_rejected(&blocked) && !http::is_transient(&blocked));
+        assert_eq!(http::status_of(&blocked), Some(403));
+        let bad_request = failure(400, &exception("ValidationException"));
+        assert!(!http::is_login_rejected(&bad_request));
+        for outage in [429, 500, 503] {
+            let err = failure(outage, &exception("UnrecognizedClientException"));
+            assert!(
+                http::is_transient(&err) && !http::is_login_rejected(&err),
+                "{outage}"
+            );
+        }
+        // The body in the message has its secrets taken out.
+        let leaky = failure(
+            403,
+            r#"{"__type":"AccessDeniedException","message":"denied","token":"SECRET"}"#,
+        );
+        assert!(http::is_login_rejected(&leaky));
+        assert!(!leaky.to_string().contains("SECRET"), "{leaky}");
     }
 
     #[test]
@@ -1003,18 +1363,51 @@ mod tests {
     }
 
     #[test]
-    fn reports_an_entitlements_error() -> eyre::Result<()> {
+    fn titles_lose_trademark_signs_and_extra_spaces() -> eyre::Result<()> {
         let response: EntitlementsResponse = serde_json::from_str(
-            r#"{"__type":"com.amazon.coral.service#UnrecognizedClientException","message":"Invalid token"}"#,
+            r#"{"entitlements":[
+                {"id":"e1","product":{"id":"p1","title":"  STAR WARS\u2122  Battlefront\u00ae "}},
+                {"id":"e2","product":{"id":"p2","title":" \u2122 "}}
+            ]}"#,
         )?;
-        let err = entitlements_page(response)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+        let games = owned_games(entitlements_page(response)?.entitlements);
+        let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
+        // A title that is only a sign is no title.
+        assert_eq!(titles, vec!["STAR WARS Battlefront"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_an_entitlements_error() -> eyre::Result<()> {
+        // Amazon names an auth exception: the login was refused.
+        let response: EntitlementsResponse =
+            serde_json::from_str(&exception("UnrecognizedClientException"))?;
+        let Err(refused) = entitlements_page(response) else {
+            eyre::bail!("an error answer was read as a page of games");
+        };
+        assert!(http::is_login_rejected(&refused));
+        let message = refused.to_string();
         assert!(
-            err.contains("UnrecognizedClientException: Invalid token"),
-            "{err}"
+            message.contains("UnrecognizedClientException: Invalid token"),
+            "{message}"
         );
+
+        // Any other answer without the list is an error that is not about the login.
+        for body in [
+            r#"{"__type":"com.amazon.coral.service#InternalFailure","message":"Try again"}"#,
+            r#"{"message":"Service unavailable"}"#,
+            "{}",
+        ] {
+            let response: EntitlementsResponse = serde_json::from_str(body)?;
+            let result = entitlements_page(response);
+            assert!(
+                result.is_err_and(|e| {
+                    !http::is_login_rejected(&e)
+                        && e.to_string().contains("did not send the list of games")
+                }),
+                "{body}"
+            );
+        }
         Ok(())
     }
 
@@ -1025,11 +1418,55 @@ mod tests {
             refresh_token: "r".into(),
             expires_at: 5,
             device_serial: "S".into(),
-            client_id: "C".into(),
-            user_id: None,
         };
         let value = serde_json::to_value(&session)?;
         assert_eq!(serde_json::from_value::<AmazonSession>(value)?, session);
         Ok(())
+    }
+
+    #[test]
+    fn sessions_saved_by_earlier_builds_are_still_read() -> eyre::Result<()> {
+        // Earlier builds also saved a client id and a user id.
+        let saved = Session {
+            account_name: Some("Jane Player".into()),
+            data: serde_json::json!({
+                "access_token": "Atna|access",
+                "refresh_token": "Atnr|refresh",
+                "expires_at": 4600,
+                "device_serial": "SERIAL",
+                "client_id": "53455249414c234132554d56484f58375550345637",
+                "user_id": "amzn1.account.TEST"
+            }),
+        };
+        let session: AmazonSession = session_data(StoreId::Amazon, &saved)?;
+        assert_eq!(session.access_token, "Atna|access");
+        assert_eq!(session.refresh_token, "Atnr|refresh");
+        assert_eq!(session.expires_at, 4600);
+        assert_eq!(session.device_serial, "SERIAL");
+
+        let unreadable = Session {
+            account_name: None,
+            data: serde_json::json!({ "cookies": [] }),
+        };
+        let result = session_data::<AmazonSession>(StoreId::Amazon, &unreadable);
+        assert!(result.is_err_and(|e| http::is_login_rejected(&e)));
+        Ok(())
+    }
+
+    #[test]
+    fn debug_output_hides_tokens_and_the_verifier() {
+        let session = AmazonSession {
+            access_token: "Atna|SECRET".into(),
+            refresh_token: "Atnr|SECRET".into(),
+            expires_at: 5,
+            device_serial: "SERIAL".into(),
+        };
+        let state = LoginState {
+            code_verifier: "SECRET-verifier".into(),
+            ..state()
+        };
+        let shown = format!("{session:?} {state:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        assert!(shown.contains("SERIAL"), "{shown}");
     }
 }

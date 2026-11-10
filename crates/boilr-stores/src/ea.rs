@@ -1,90 +1,115 @@
 //! EA app. Follows Jeshibu's EaLibrary for Playnite
-//! (github.com/Jeshibu/PlayniteExtensions, `source/EaLibrary/Services/EaWebsite.cs`).
+//! (github.com/Jeshibu/PlayniteExtensions, `source/EaLibrary`: `Services/EaWebsite.cs` and
+//! `EaLibraryDataGatherer.cs`).
 //!
 //! Login: the user signs in on www.ea.com. EA's site sends the browser through
 //! accounts.ea.com and signin.ea.com and back to `https://www.ea.com/login_check?code=…`;
-//! by then accounts.ea.com has set its session cookies (`sid`, `remid`), which is all we keep.
+//! by then accounts.ea.com has set its session cookies (`sid`, `remid`). BoilR keeps the
+//! cookies a browser would send to accounts.ea.com (those two, and what EA sets for all of
+//! ea.com) and none of EA's other hosts.
 //!
 //! Library: every refresh trades those cookies for a fresh, short-lived access token
 //! (`accounts.ea.com/connect/auth?client_id=ORIGIN_JS_SDK&…&prompt=none`), lists the owned
 //! games with the GraphQL query the EA website uses (`getPreloadedOwnedGames`), then looks up
 //! each offer's content id in EA's catalog (`legacyOffers`).
 //!
+//! The game list is asked for by the hash of a query EA's website registered (a persisted
+//! query); BoilR does not have the query's text. When EA's website moves to another query,
+//! the hash stops working and BoilR needs an update.
+//!
+//! Not listed:
+//! - games the account only has through a linked Steam or Epic account (see
+//!   `only_through_linked_store`);
+//! - open trials the account holds nothing else of (see `is_unowned_trial`).
+//!
 //! [`OwnedGame::id`] is the offer id (`Origin.OFR.50.0002487`, `OFB-EAST:52735`, `DR:225064100`).
 //! `extra` keys:
-//! - `offer_id`: same as `id`.
 //! - `content_id`: catalog content id. The EA app's install/launch link takes it:
 //!   `origin2://game/launch/?offerIds=<content_id>` (EaLibrary `EaControllerHelper.cs`).
-//! - `slug`: the game's slug on ea.com (`a-way-out`).
-//! - `product_id`: EA's product id for this edition.
-//! - `ownership_methods`: EA's ownership methods, comma-separated (`PURCHASE,ENTITLEMENT_GRANT`).
-//! - `access`: how the account has the game, one of `ea` (bought on EA), `steam` or `epic`
-//!   (bought there and linked to the EA account), `ea_play` or `game_pass` (subscription).
+//!   Absent when the catalog lookup failed and no earlier list had it.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future};
 
+use eyre::WrapErr;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use crate::{
     http::{self, cookie_jar},
-    Cookie, LoginCapture, ManualLogin, OwnedGame, PendingLogin, Session, StoreId,
+    Cookie, Fetch, LoginCapture, ManualLogin, OwnedGame, PendingLogin, Session, StoreId,
 };
 
 const LOGIN_URL: &str = "https://www.ea.com/login";
 /// EA's site redirects here (with `?code=…`) once accounts.ea.com accepted the sign-in.
 const LOGIN_DONE_PREFIX: &str = "https://www.ea.com/login_check";
-const COOKIE_URLS: [&str; 3] = [
-    "https://accounts.ea.com/",
-    "https://signin.ea.com/",
-    "https://www.ea.com/",
-];
-const COOKIE_DOMAIN: &str = "ea.com";
-/// The host whose cookies carry the EA sign-in; refreshed cookies are read back from it.
+/// The host whose cookies carry the EA sign-in.
 const ACCOUNTS_HOST: &str = "accounts.ea.com";
-const TOKEN_URL: &str = "https://accounts.ea.com/connect/auth?client_id=ORIGIN_JS_SDK&response_type=token&redirect_uri=nucleus:rest&prompt=none";
+/// Where a refresh gets its access token. A cookie EA sets here without a `Path` is scoped
+/// to `/connect`, and is not handed out for the host's root URL: the login window is asked
+/// for this URL's cookies too, and renewed cookies are read back for it.
+const AUTH_URL: &str = "https://accounts.ea.com/connect/auth";
+const TOKEN_QUERY: &str =
+    "client_id=ORIGIN_JS_SDK&response_type=token&redirect_uri=nucleus:rest&prompt=none";
+/// Cookies set for all of ea.com come with these too.
+const COOKIE_URLS: [&str; 2] = ["https://accounts.ea.com/", AUTH_URL];
 const GRAPHQL_URL: &str = "https://service-aggregation-layer.juno.ea.com/graphql";
 const OWNED_GAMES_QUERY_HASH: &str =
     "779f1cd1355699752e20c0b3877847f4e3010ef5de131c248e98f8eff84f0718";
 const PAGE_SIZE: u32 = 500;
+const FIRST_PAGE: &str = "0";
 const MAX_PAGES: usize = 50;
 const LEGACY_OFFER_BATCH: usize = 100;
 
-const REAL_OWNERSHIP: [&str; 8] = [
+/// Every way an account can have a game, as EaLibrary asks for them (`EaWebsite.GetGamesUrl`).
+/// The `STEAM…` and `EPIC…` ones come from a linked Steam or Epic account
+/// ([`is_linked_store`]); `VAULT` is EA Play and `XGP_VAULT` Xbox Game Pass.
+const OWNERSHIP_METHODS: [&str; 16] = [
     "UNKNOWN",
     "ASSOCIATION",
     "PURCHASE",
     "REDEMPTION",
     "GIFT_RECEIPT",
-    "ENTITLEMENT_GRANT",
+    GRANT,
     "DIRECT_ENTITLEMENT",
     "PRE_ORDER_PURCHASE",
-];
-const EA_PLAY_OWNERSHIP: [&str; 5] = [
     "VAULT",
+    "XGP_VAULT",
+    "STEAM",
     "STEAM_VAULT",
     "STEAM_SUBSCRIPTION",
+    "EPIC",
     "EPIC_VAULT",
     "EPIC_SUBSCRIPTION",
 ];
+/// EA's own entitlement record. Most games bought on EA carry it, but so do games bought on
+/// Steam (EaLibrary's sample answer has `["STEAM", "ENTITLEMENT_GRANT"]`), so on its own it
+/// does not say where a game comes from.
+const GRANT: &str = "ENTITLEMENT_GRANT";
 
 /// What the session file holds.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct EaSession {
     cookies: Vec<Cookie>,
 }
 
 pub fn begin_login() -> PendingLogin {
     PendingLogin {
+        page_text_url_prefixes: vec![],
         store: StoreId::Ea,
         start_url: LOGIN_URL.to_string(),
         done_url_prefixes: vec![LOGIN_DONE_PREFIX.to_string()],
         cookie_urls: COOKIE_URLS.iter().map(|u| u.to_string()).collect(),
         // The sign-in lives in HttpOnly cookies, which a user cannot reasonably copy.
         manual: ManualLogin::Unsupported,
-        user_agent: None,
+        user_agent: Some(http::BROWSER_USER_AGENT.to_string()),
         state: serde_json::Value::Null,
     }
+}
+
+/// The cookies of a sign-in that BoilR keeps: the ones a browser would send to
+/// accounts.ea.com, the only host that is asked for a token.
+fn session_cookies(captured: &[Cookie]) -> Vec<Cookie> {
+    cookie_jar::keep_for_hosts(captured, &[ACCOUNTS_HOST])
 }
 
 pub async fn complete_login(
@@ -92,32 +117,35 @@ pub async fn complete_login(
     _pending: &PendingLogin,
     capture: &LoginCapture,
 ) -> eyre::Result<Session> {
-    let mut cookies = cookie_jar::keep_domain(&capture.cookies, COOKIE_DOMAIN);
+    let mut cookies = session_cookies(&capture.cookies);
     if cookies.is_empty() {
         return Err(eyre::format_err!(
-            "The EA sign-in window returned no ea.com cookies. Sign in again."
+            "The EA sign-in window handed over no cookies for {ACCOUNTS_HOST}, so the sign-in \
+             could not be kept."
         ));
     }
     let (client, jar) = cookie_jar::client_with(&cookies)?;
     let token = access_token(&client)
         .await
-        .map_err(|err| eyre::format_err!("Signing in to EA did not finish: {err}"))?;
+        .wrap_err("Signing in to EA did not finish")?;
     let account_name = player_name(&client, &token).await;
-    cookie_jar::refresh(&mut cookies, &jar, &[ACCOUNTS_HOST]);
+    cookie_jar::refresh(&mut cookies, &jar, &[AUTH_URL]);
     Ok(Session {
         account_name,
         data: serde_json::to_value(EaSession { cookies })?,
     })
 }
 
-pub async fn fetch_owned(_client: &Client, session: &mut Session) -> eyre::Result<Vec<OwnedGame>> {
-    let mut data: EaSession = serde_json::from_value(session.data.clone()).map_err(|err| {
-        eyre::format_err!("The saved EA login is unreadable ({err}). Sign in again.")
-    })?;
+pub async fn fetch_owned(
+    _client: &Client,
+    session: &mut Session,
+    fetch: &mut Fetch<'_>,
+) -> eyre::Result<Vec<OwnedGame>> {
+    let mut data: EaSession = crate::session_data(StoreId::Ea, session)?;
     let (client, jar) = cookie_jar::client_with(&data.cookies)?;
     let token = access_token(&client).await;
     // EA may have renewed `sid`; keep the renewed cookies even when something below fails.
-    cookie_jar::refresh(&mut data.cookies, &jar, &[ACCOUNTS_HOST]);
+    cookie_jar::refresh(&mut data.cookies, &jar, &[AUTH_URL]);
     session.data = serde_json::to_value(&data)?;
     let token = token?;
 
@@ -125,38 +153,62 @@ pub async fn fetch_owned(_client: &Client, session: &mut Session) -> eyre::Resul
         session.account_name = player_name(&client, &token).await;
     }
 
-    let mut games = Vec::new();
-    let mut cursor = "0".to_string();
-    for _ in 0..MAX_PAGES {
-        let body = graphql_get(&client, &token, &owned_games_url(&cursor)?).await?;
-        let page = parse_owned_games_page(&body)?;
-        games.extend(page.games);
-        match page.next {
-            Some(next) if !next.is_empty() && next != cursor => cursor = next,
-            _ => break,
-        }
-    }
+    let (client, token) = (&client, token.as_str());
+    let games = http::paginate(
+        "EA's game list",
+        FIRST_PAGE.to_string(),
+        MAX_PAGES,
+        |cursor| async move {
+            let url = owned_games_url(&cursor)?;
+            let page = graphql_get(client, token, &url, parse_owned_games_page).await?;
+            Ok((page.games, page.next))
+        },
+    )
+    .await?;
 
     // Content ids only improve the install link and matching installed copies; without
     // them the offer id is used, so a failed lookup never fails the library. Ids the lookup
-    // did not return come from the previous library, so one failed lookup does not unmatch
+    // did not return come from the previous list, so one failed lookup does not unmatch
     // installed games until the next refresh. (Like EaLibrary, the catalog lookup is sent
     // without a token.)
     let offer_ids: Vec<String> = games.iter().map(|g| g.id.clone()).collect();
-    let mut content_ids = HashMap::new();
-    for batch in offer_ids.chunks(LEGACY_OFFER_BATCH) {
-        match legacy_content_ids(&client, batch).await {
-            Ok(found) => content_ids.extend(found),
-            Err(err) => eprintln!(
-                "Could not look up EA content ids, using the ones from before: {}",
-                http::redact(&format!("{err:#}"))
-            ),
+    let (content_ids, failed) = lookup_in_batches(&offer_ids, LEGACY_OFFER_BATCH, |batch| {
+        legacy_content_ids(client, batch)
+    })
+    .await;
+    let games = with_content_ids(games, &content_ids, fetch.previous);
+    if let Some(err) = failed {
+        eprintln!(
+            "Could not look up EA content ids, using the ones from before: {}",
+            http::redact(&format!("{err:#}"))
+        );
+        if games.iter().any(|g| g.extra("content_id").is_none()) {
+            fetch.partial = true;
         }
     }
-    let previous = crate::cached_library(StoreId::Ea)
-        .map(|l| l.games)
-        .unwrap_or_default();
-    Ok(with_content_ids(games, &content_ids, &previous))
+    Ok(games)
+}
+
+/// Looks ids up `size` at a time. The first batch that fails ends the lookup: with the
+/// catalog down, every further batch would only wait for its own timeout. Returns what was
+/// found until then, and the failure.
+async fn lookup_in_batches<'a, F, Fut>(
+    ids: &'a [String],
+    size: usize,
+    mut lookup: F,
+) -> (HashMap<String, String>, Option<eyre::Report>)
+where
+    F: FnMut(&'a [String]) -> Fut,
+    Fut: Future<Output = eyre::Result<HashMap<String, String>>>,
+{
+    let mut found = HashMap::new();
+    for batch in ids.chunks(size.max(1)) {
+        match lookup(batch).await {
+            Ok(ids) => found.extend(ids),
+            Err(err) => return (found, Some(err)),
+        }
+    }
+    (found, None)
 }
 
 fn with_content_ids(
@@ -202,12 +254,14 @@ pub fn manifest_ids(manifest_id: &str) -> Vec<String> {
 
 async fn access_token(client: &Client) -> eyre::Result<String> {
     let response = client
-        .get(TOKEN_URL)
+        .get(format!("{AUTH_URL}?{TOKEN_QUERY}"))
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
-        .await?;
-    let body = response.text().await?;
-    parse_token_response(&body)
+        .await
+        .map_err(http::request_failed)?;
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(http::request_failed)?;
+    token_from_answer(status, &body)
 }
 
 /// The display name of the signed-in account, if EA hands it out. Never fails a login.
@@ -223,19 +277,22 @@ async fn player_name(client: &Client, token: &str) -> Option<String> {
     parse_player_name(&response.text().await.ok()?)
 }
 
-/// GETs a GraphQL URL. EA answers a rejected token with 401 and a GraphQL error body, which
-/// the parsers turn into a readable error, so the body is returned whatever the status.
-async fn graphql_get(client: &Client, token: &str, url: &str) -> eyre::Result<String> {
-    let response = client.get(url).bearer_auth(token).send().await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() && serde_json::from_str::<serde_json::Value>(&body).is_err() {
-        return Err(eyre::format_err!(
-            "{status} from EA's library service: {}",
-            http::snippet(&body)
-        ));
-    }
-    Ok(body)
+/// GETs a GraphQL URL and reads the answer with `parse`; see [`graphql_answer`].
+async fn graphql_get<T>(
+    client: &Client,
+    token: &str,
+    url: &str,
+    parse: fn(&str) -> eyre::Result<T>,
+) -> eyre::Result<T> {
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(http::request_failed)?;
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(http::request_failed)?;
+    graphql_answer(status, &body, parse)
 }
 
 async fn legacy_content_ids(
@@ -249,7 +306,8 @@ async fn legacy_content_ids(
         "variables": { "locale": "DEFAULT", "offerIds": offer_ids },
     });
     let response = http::send(client.post(GRAPHQL_URL).json(&body)).await?;
-    parse_legacy_offers(&response.text().await?)
+    let answer = response.text().await.map_err(http::request_failed)?;
+    parse_legacy_offers(&answer)
 }
 
 fn owned_games_url(cursor: &str) -> eyre::Result<String> {
@@ -263,12 +321,7 @@ fn owned_games_url(cursor: &str) -> eyre::Result<String> {
         "type": ["DIGITAL_FULL_GAME", "PACKAGED_FULL_GAME"],
         "entitlementEnabled": true,
         "storefronts": ["EA", "STEAM", "EPIC"],
-        "ownershipMethods": [
-            "UNKNOWN", "ASSOCIATION", "PURCHASE", "REDEMPTION", "GIFT_RECEIPT",
-            "ENTITLEMENT_GRANT", "DIRECT_ENTITLEMENT", "PRE_ORDER_PURCHASE", "VAULT",
-            "XGP_VAULT", "STEAM", "STEAM_VAULT", "STEAM_SUBSCRIPTION", "EPIC", "EPIC_VAULT",
-            "EPIC_SUBSCRIPTION"
-        ],
+        "ownershipMethods": OWNERSHIP_METHODS,
         "platforms": ["PC"],
     });
     let extensions = serde_json::json!({
@@ -282,34 +335,85 @@ fn owned_games_url(cursor: &str) -> eyre::Result<String> {
     Ok(url.into())
 }
 
-// ---- Parsing (pure) ----
+// ---- Reading answers (pure) ----
 
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
+#[derive(Default, Deserialize)]
+struct TokenAnswer {
     access_token: Option<String>,
     error: Option<String>,
+    error_code: Option<String>,
 }
 
-fn parse_token_response(body: &str) -> eyre::Result<String> {
-    let parsed: TokenResponse = serde_json::from_str(body).map_err(|_| {
-        eyre::format_err!(
-            "EA did not hand out an access token; the saved sign-in has probably expired. Sign in again. EA answered: {}",
-            http::snippet(body)
-        )
-    })?;
-    match (parsed.access_token, parsed.error) {
-        (Some(token), _) if !token.is_empty() => Ok(token),
-        (_, Some(error)) if error == "login_required" => Err(eyre::format_err!(
-            "Your EA sign-in has expired. Sign in again."
+fn failed_with(status: u16, url: &str, body: &str) -> eyre::Report {
+    eyre::Report::new(http::HttpStatus {
+        status,
+        url: url.to_string(),
+        body: http::snippet(body),
+    })
+}
+
+/// The access token in EA's answer to the token request, or why there is none. Only EA
+/// saying that a login is required counts as a refused login: an outage or a rate limit is
+/// transient, and anything else is reported as it is.
+fn token_from_answer(status: u16, body: &str) -> eyre::Result<String> {
+    let answer: TokenAnswer = serde_json::from_str(body).unwrap_or_default();
+    let success = (200..300).contains(&status);
+    if let Some(token) = answer.access_token.filter(|t| success && !t.is_empty()) {
+        return Ok(token);
+    }
+    if http::is_transient_status(status) {
+        return Err(failed_with(status, AUTH_URL, body));
+    }
+    let errors = [answer.error, answer.error_code];
+    let mut errors = errors.iter().flatten();
+    if errors.clone().any(|error| error == "login_required") {
+        return Err(http::login_rejected(
+            "EA no longer accepts the saved sign-in (it answered \"login_required\"). Sign in again.",
+        ));
+    }
+    match errors.next() {
+        Some(error) => Err(eyre::format_err!(
+            "EA did not hand out an access token: it answered \"{error}\" (HTTP {status})"
         )),
-        (_, Some(error)) => Err(eyre::format_err!(
-            "EA refused the saved sign-in ({error}). Sign in again."
-        )),
-        _ => Err(eyre::format_err!(
-            "EA did not hand out an access token. Sign in again. EA answered: {}",
+        None if !success => Err(failed_with(status, AUTH_URL, body)),
+        None => Err(eyre::format_err!(
+            "Unexpected answer from EA's sign-in service, without an access token: {}",
             http::snippet(body)
         )),
     }
+}
+
+/// Whether a body is a GraphQL answer: an object with `data` or a list of `errors`.
+fn is_graphql(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|answer| {
+        answer.get("data").is_some() || answer.get("errors").is_some_and(|e| e.is_array())
+    })
+}
+
+/// Reads an answer of EA's GraphQL service with `parse`.
+///
+/// A failure status is always an error. When its body is a GraphQL answer, EA's own error
+/// in it is reported, because it says more than the status: EA answers a rejected token
+/// with 401 and an `UNAUTHENTICATED` error, and a persisted query it no longer knows with
+/// an error too. That holds unless the status says "sign in again" (401) or "not now" (429,
+/// 5xx) and EA's error does not: then the status is reported, so the failure keeps its kind.
+fn graphql_answer<T>(
+    status: u16,
+    body: &str,
+    parse: impl FnOnce(&str) -> eyre::Result<T>,
+) -> eyre::Result<T> {
+    if (200..300).contains(&status) {
+        return parse(body);
+    }
+    if is_graphql(body) {
+        if let Err(err) = parse(body) {
+            let status_says_more = status == 401 || http::is_transient_status(status);
+            if http::is_login_rejected(&err) || !status_says_more {
+                return Err(err);
+            }
+        }
+    }
+    Err(failed_with(status, GRAPHQL_URL, body))
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,36 +433,52 @@ struct GraphQlErrorExtensions {
     code: Option<String>,
 }
 
+impl GraphQlError {
+    fn code(&self) -> Option<&str> {
+        self.extensions.as_ref()?.code.as_deref()
+    }
+
+    /// Apollo's answer to the hash of a persisted query it does not know (any more).
+    fn is_unknown_persisted_query(&self) -> bool {
+        matches!(
+            self.code(),
+            Some("PERSISTED_QUERY_NOT_FOUND" | "PERSISTED_QUERY_NOT_SUPPORTED")
+        ) || matches!(
+            self.message.as_deref(),
+            Some("PersistedQueryNotFound" | "PersistedQueryNotSupported")
+        )
+    }
+}
+
 impl<T> GraphQlResponse<T> {
-    /// The data, or a readable error built from `errors`. Partial data (data plus errors on
-    /// some fields) is kept, unless EA says the sign-in is not valid.
-    fn into_data(self, what: &str) -> eyre::Result<T> {
+    /// What `pick` finds in the data, or a readable error built from `errors`. Partial data
+    /// (data plus errors on some fields) is kept, unless EA says the sign-in is not valid.
+    fn into_data<U>(self, what: &str, pick: impl FnOnce(T) -> Option<U>) -> eyre::Result<U> {
         let errors = self.errors.unwrap_or_default();
-        if errors.iter().any(|e| {
-            e.extensions
-                .as_ref()
-                .and_then(|x| x.code.as_deref())
-                .is_some_and(|code| code == "UNAUTHENTICATED")
-        }) {
+        if errors.iter().any(|e| e.code() == Some("UNAUTHENTICATED")) {
+            return Err(http::login_rejected(format!(
+                "EA no longer accepts the saved sign-in (it answered \"not authenticated\" \
+                 while listing {what}). Sign in again."
+            )));
+        }
+        if errors.iter().any(GraphQlError::is_unknown_persisted_query) {
             return Err(eyre::format_err!(
-                "EA rejected the saved sign-in while listing {what}. Sign in again."
+                "EA changed how its website lists {what}, and BoilR needs an update to read \
+                 them. (EA no longer knows the request BoilR sends.)"
             ));
         }
-        match self.data {
-            Some(data) => Ok(data),
-            None => {
-                let messages: Vec<&str> =
-                    errors.iter().filter_map(|e| e.message.as_deref()).collect();
-                Err(eyre::format_err!(
-                    "EA could not list {what}: {}",
-                    if messages.is_empty() {
-                        "no data in the answer".to_string()
-                    } else {
-                        messages.join("; ")
-                    }
-                ))
-            }
+        if let Some(found) = self.data.and_then(pick) {
+            return Ok(found);
         }
+        let messages: Vec<&str> = errors.iter().filter_map(|e| e.message.as_deref()).collect();
+        Err(eyre::format_err!(
+            "EA could not list {what}: {}",
+            if messages.is_empty() {
+                "no data in the answer".to_string()
+            } else {
+                messages.join("; ")
+            }
+        ))
     }
 }
 
@@ -390,9 +510,9 @@ struct OwnedGameProduct {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Product {
-    id: Option<String>,
     name: Option<String>,
-    game_slug: Option<String>,
+    /// The product is itself an open trial, not the game.
+    is_ungated_trial: Option<bool>,
     base_item: Option<BaseItem>,
     game_product_user: Option<GameProductUser>,
 }
@@ -406,6 +526,8 @@ struct BaseItem {
 #[serde(rename_all = "camelCase")]
 struct GameProductUser {
     ownership_methods: Option<Vec<String>>,
+    /// The account's trial of this product (its remaining time), when it started one.
+    game_product_user_trial: Option<IgnoredAny>,
 }
 
 #[derive(Debug)]
@@ -421,11 +543,7 @@ fn parse_owned_games_page(body: &str) -> eyre::Result<ParsedPage> {
             http::snippet(body)
         )
     })?;
-    let page = response
-        .into_data("your games")?
-        .me
-        .and_then(|me| me.owned_game_products)
-        .ok_or_else(|| eyre::format_err!("EA returned no game list for this account"))?;
+    let page = response.into_data("your games", |data| data.me?.owned_game_products)?;
     Ok(ParsedPage {
         games: page
             .items
@@ -433,7 +551,7 @@ fn parse_owned_games_page(body: &str) -> eyre::Result<ParsedPage> {
             .into_iter()
             .filter_map(to_owned_game)
             .collect(),
-        next: page.next,
+        next: page.next.filter(|next| !next.is_empty()),
     })
 }
 
@@ -444,62 +562,62 @@ fn to_owned_game(item: OwnedGameProduct) -> Option<OwnedGame> {
         .or(item.id)
         .filter(|id| !id.is_empty())?;
     let product = item.product?;
+    let user = product.game_product_user;
+    let trial_started = user
+        .as_ref()
+        .is_some_and(|u| u.game_product_user_trial.is_some());
+    let methods = user.and_then(|u| u.ownership_methods).unwrap_or_default();
+    let trial_product = product.is_ungated_trial == Some(true);
+    if only_through_linked_store(&methods)
+        || is_unowned_trial(trial_product, trial_started, &methods)
+    {
+        return None;
+    }
     let title = product
         .name
         .as_deref()
-        .map(clean_title)
+        .map(crate::clean_title)
         .filter(|t| !t.is_empty())
         .or_else(|| {
             product
                 .base_item
                 .as_ref()
                 .and_then(|b| b.title.as_deref())
-                .map(clean_title)
+                .map(crate::clean_title)
         })
         .filter(|t| !t.is_empty())?;
-    let methods = product
-        .game_product_user
-        .and_then(|u| u.ownership_methods)
-        .unwrap_or_default();
-    let mut game = OwnedGame::new(StoreId::Ea, offer_id.clone(), title)
-        .with_extra("offer_id", offer_id)
-        .with_extra("access", access(&methods))
-        .with_extra("ownership_methods", methods.join(","));
-    if let Some(slug) = product.game_slug.filter(|s| !s.is_empty()) {
-        game = game.with_extra("slug", slug);
-    }
-    if let Some(product_id) = product.id.filter(|s| !s.is_empty()) {
-        game = game.with_extra("product_id", product_id);
-    }
-    Some(game)
+    Some(OwnedGame::new(StoreId::Ea, offer_id, title))
 }
 
-/// How the account has a game, from EA's ownership methods. A purchase on another store wins
-/// over an EA entitlement (Steam purchases also carry `ENTITLEMENT_GRANT`), and owning wins
-/// over a subscription.
-fn access(methods: &[String]) -> &'static str {
-    let has = |m: &str| methods.iter().any(|x| x == m);
-    if has("STEAM") {
-        "steam"
-    } else if has("EPIC") {
-        "epic"
-    } else if REAL_OWNERSHIP.iter().any(|m| has(m)) {
-        "ea"
-    } else if has("XGP_VAULT") {
-        "game_pass"
-    } else if EA_PLAY_OWNERSHIP.iter().any(|m| has(m)) {
-        "ea_play"
-    } else {
-        "ea"
-    }
+/// An ownership method that comes from a linked Steam or Epic account: a purchase there
+/// (`STEAM`, `EPIC`) or an EA Play subscription taken out there (`STEAM_VAULT`,
+/// `STEAM_SUBSCRIPTION`, `EPIC_VAULT`, `EPIC_SUBSCRIPTION`).
+fn is_linked_store(method: &str) -> bool {
+    method.starts_with("STEAM") || method.starts_with("EPIC")
 }
 
-/// Drops trademark signs, which EA puts in most names and which hurt artwork searches.
-fn clean_title(name: &str) -> String {
-    name.replace(['™', '®', '©'], "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Whether nothing but a linked Steam or Epic account gives the EA account this game. Such
+/// a game belongs to that store (Steam has it already, the Epic account adds it), and the
+/// EA app cannot install it, so it is not listed.
+///
+/// Anything EA itself gives wins: a purchase or a code redeemed on EA, EA Play, Game Pass,
+/// and methods BoilR does not know. The exception is `ENTITLEMENT_GRANT` ([`GRANT`]), which
+/// comes with Steam purchases too and so proves nothing next to a linked store.
+fn only_through_linked_store(methods: &[String]) -> bool {
+    methods.iter().any(|m| is_linked_store(m))
+        && methods.iter().all(|m| is_linked_store(m) || m == GRANT)
+}
+
+/// Whether an entry is a trial of a game the account does not have.
+///
+/// EA's answer carries several trial fields, and most of them say nothing about ownership:
+/// in EaLibrary's sample answer a bought game (`A Way Out`, with its free Friend's Pass)
+/// has both `trialDetails` and a `gameProductUserTrial`. So an entry is only skipped when
+/// everything agrees: EA marks the product itself as an open trial (`isUngatedTrial`), the
+/// account started that trial, and nothing but the grant a free trial is claimed with gives
+/// the account the product. In every other case the game is kept.
+fn is_unowned_trial(trial_product: bool, trial_started: bool, methods: &[String]) -> bool {
+    trial_product && trial_started && methods.iter().all(|m| m == GRANT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,9 +643,9 @@ fn parse_legacy_offers(body: &str) -> eyre::Result<HashMap<String, String>> {
             )
         })?;
     Ok(response
-        .into_data("game details")?
-        .legacy_offers
-        .unwrap_or_default()
+        .into_data("game details", |data| {
+            Some(data.legacy_offers.unwrap_or_default())
+        })?
         .into_iter()
         .flatten()
         .filter_map(|o| match (o.offer_id, o.content_id) {
@@ -569,9 +687,9 @@ fn parse_player_name(body: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn fixture(name: &str) -> String {
+    fn fixture(name: &str) -> eyre::Result<String> {
         let path = format!("{}/testdata/ea/{name}", env!("CARGO_MANIFEST_DIR"));
-        std::fs::read_to_string(&path).unwrap_or_else(|err| format!("missing {path}: {err}"))
+        std::fs::read_to_string(&path).wrap_err(path)
     }
 
     fn cookie(name: &str, value: &str, domain: &str) -> Cookie {
@@ -580,6 +698,24 @@ mod tests {
             value: value.into(),
             domain: domain.into(),
         }
+    }
+
+    fn methods(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    fn run<T>(future: impl Future<Output = T>) -> eyre::Result<T> {
+        Ok(tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(future))
+    }
+
+    /// The failure, when it is neither a refused login nor a transient one.
+    fn plain_error<T>(result: eyre::Result<T>) -> Option<String> {
+        result
+            .err()
+            .filter(|e| !http::is_login_rejected(e) && !http::is_transient(e))
+            .map(|e| e.to_string())
     }
 
     #[test]
@@ -599,60 +735,113 @@ mod tests {
     }
 
     #[test]
+    fn the_login_window_is_asked_for_what_the_token_request_needs() {
+        let pending = begin_login();
+        // Cookies scoped to `/connect` are not handed out for the root URL.
+        assert!(pending.cookie_urls.iter().any(|url| url == AUTH_URL));
+        assert!(pending
+            .cookie_urls
+            .iter()
+            .all(|url| url.starts_with(&format!("https://{ACCOUNTS_HOST}/"))));
+        // The session is replayed under the user agent it was made with.
+        assert_eq!(
+            pending.user_agent.as_deref(),
+            Some(http::BROWSER_USER_AGENT)
+        );
+    }
+
+    #[test]
+    fn only_cookies_for_the_accounts_host_are_kept() {
+        // Domains as a login window reports them: without a leading dot.
+        let captured = vec![
+            cookie("sid", "s", "accounts.ea.com"),
+            cookie("remid", "r", "accounts.ea.com"),
+            cookie("site", "e", "ea.com"),
+            cookie("signin", "x", "signin.ea.com"),
+            cookie("shop", "w", "www.ea.com"),
+            cookie("tracker", "t", "example.com"),
+            cookie("lookalike", "l", "notea.com"),
+        ];
+        let kept = session_cookies(&captured);
+        let names: Vec<&str> = kept.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["sid", "remid", "site"]);
+        assert!(session_cookies(&[cookie("shop", "w", "www.ea.com")]).is_empty());
+    }
+
+    #[test]
     fn reads_access_token() -> eyre::Result<()> {
         assert_eq!(
-            parse_token_response(&fixture("token_ok.json"))?,
+            token_from_answer(200, &fixture("token_ok.json")?)?,
             "QVQwOjIuMDozLjA6NjA6dGVzdHRva2Vu"
         );
         Ok(())
     }
 
     #[test]
-    fn expired_cookies_ask_to_sign_in_again() {
-        let err = parse_token_response(&fixture("token_login_required.json"))
-            .map(|_| ())
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(err.contains("Sign in again"), "{err}");
+    fn only_a_required_login_asks_to_sign_in_again() -> eyre::Result<()> {
+        let login_required = fixture("token_login_required.json")?;
+        for status in [200, 400, 401] {
+            let refused = token_from_answer(status, &login_required);
+            assert!(
+                refused.is_err_and(|e| http::is_login_rejected(&e)),
+                "{status}"
+            );
+        }
 
-        let err = parse_token_response("<html>login</html>")
-            .err()
-            .map(|e| e.to_string())
+        // An outage or a rate limit, whatever the body says.
+        for (status, body) in [
+            (503, "<html>Service Unavailable</html>"),
+            (502, ""),
+            (429, r#"{"error":"too_many_requests"}"#),
+            (500, login_required.as_str()),
+        ] {
+            let outage = token_from_answer(status, body);
+            assert!(
+                outage.is_err_and(|e| http::is_transient(&e) && !http::is_login_rejected(&e)),
+                "{status}"
+            );
+        }
+
+        // Another error is reported with EA's own word for it.
+        let other = plain_error(token_from_answer(400, r#"{"error":"invalid_request"}"#))
             .unwrap_or_default();
-        assert!(err.contains("Sign in again"), "{err}");
+        assert!(other.contains("invalid_request"), "{other}");
+
+        // A page where JSON was expected, a bot block, and a token on a failed request.
+        let page = plain_error(token_from_answer(200, "<html>login</html>")).unwrap_or_default();
+        assert!(page.contains("Unexpected answer"), "{page}");
+        let blocked = token_from_answer(403, "<html>Access Denied</html>");
+        assert!(plain_error(blocked).is_some());
+        let failed = token_from_answer(404, &fixture("token_ok.json")?);
+        assert!(plain_error(failed).is_some());
+        let empty = token_from_answer(200, r#"{"access_token":""}"#);
+        assert!(plain_error(empty).is_some());
+
+        // A 401 without EA's reason is a refused login by its status.
+        let unauthorized = token_from_answer(401, "");
+        assert!(unauthorized.is_err_and(|e| http::is_login_rejected(&e)));
+        Ok(())
     }
 
     #[test]
     fn parses_owned_games_pages() -> eyre::Result<()> {
-        let first = parse_owned_games_page(&fixture("owned_games_page1.json"))?;
+        let first = parse_owned_games_page(&fixture("owned_games_page1.json")?)?;
         assert_eq!(first.next.as_deref(), Some("Mw=="));
-        assert_eq!(first.games.len(), 3);
+        // A Way Out is only there through the linked Steam account. Crysis comes with Game
+        // Pass, which the EA app installs.
+        let titles: Vec<&str> = first.games.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, vec!["Battlefield 3", "Crysis"]);
 
-        let way_out = first
+        let battlefield = first
             .games
             .first()
             .ok_or_else(|| eyre::format_err!("empty"))?;
-        assert_eq!(way_out.store, StoreId::Ea);
-        assert_eq!(way_out.id, "Origin.OFR.50.0002487");
-        assert_eq!(way_out.title, "A Way Out");
-        assert_eq!(way_out.extra("offer_id"), Some("Origin.OFR.50.0002487"));
-        assert_eq!(way_out.extra("slug"), Some("a-way-out"));
-        assert_eq!(way_out.extra("access"), Some("steam"));
-        assert_eq!(way_out.extra("ownership_methods"), Some("STEAM"));
-        assert_eq!(
-            way_out.extra("product_id"),
-            Some("en_a-way-out-pc-jp-juno_VideoGameProduct_nl_pc")
-        );
+        assert_eq!(battlefield.store, StoreId::Ea);
+        assert_eq!(battlefield.id, "DR:225064100");
+        // The content id is added later; nothing else is kept.
+        assert!(battlefield.extra.is_empty());
 
-        let accesses: Vec<_> = first
-            .games
-            .iter()
-            .filter_map(|g| g.extra("access"))
-            .collect();
-        assert_eq!(accesses, vec!["steam", "ea", "game_pass"]);
-
-        let second = parse_owned_games_page(&fixture("owned_games_page2.json"))?;
+        let second = parse_owned_games_page(&fixture("owned_games_page2.json")?)?;
         assert_eq!(second.next, None);
         let zuma = second
             .games
@@ -661,32 +850,190 @@ mod tests {
         assert_eq!(zuma.id, "OFB-EAST:52735");
         // Trademark signs are dropped.
         assert_eq!(zuma.title, "Zuma's Revenge");
+
+        // An empty cursor ends the list like a missing one.
+        let last = parse_owned_games_page(
+            r#"{"data":{"me":{"ownedGameProducts":{"next":"","items":[]}}}}"#,
+        )?;
+        assert_eq!(last.next, None);
         Ok(())
     }
 
     #[test]
-    fn unauthenticated_library_asks_to_sign_in_again() {
-        let err = parse_owned_games_page(&fixture("not_authenticated.json"))
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(err.contains("Sign in again"), "{err}");
+    fn games_of_a_linked_store_are_left_out_unless_ea_gives_them_too() {
+        let linked_only = |names: &[&str]| only_through_linked_store(&methods(names));
+        // Bought on Steam or Epic, or part of an EA Play subscription taken out there.
+        for method in [
+            "STEAM",
+            "STEAM_VAULT",
+            "STEAM_SUBSCRIPTION",
+            "EPIC",
+            "EPIC_VAULT",
+            "EPIC_SUBSCRIPTION",
+        ] {
+            assert!(linked_only(&[method]), "{method}");
+        }
+        assert!(linked_only(&["STEAM", "EPIC"]));
+        // Steam purchases carry EA's grant too (both orders are in EaLibrary's sample).
+        assert!(linked_only(&["STEAM", "ENTITLEMENT_GRANT"]));
+        assert!(linked_only(&["ENTITLEMENT_GRANT", "STEAM"]));
+        assert!(linked_only(&["EPIC_VAULT", "ENTITLEMENT_GRANT"]));
+
+        // Real EA ownership wins.
+        assert!(!linked_only(&["STEAM", "PURCHASE", "ENTITLEMENT_GRANT"]));
+        assert!(!linked_only(&["STEAM", "REDEMPTION", "ENTITLEMENT_GRANT"]));
+        assert!(!linked_only(&["EPIC", "GIFT_RECEIPT"]));
+        assert!(!linked_only(&["STEAM_VAULT", "PRE_ORDER_PURCHASE"]));
+        assert!(!linked_only(&["EPIC_SUBSCRIPTION", "DIRECT_ENTITLEMENT"]));
+        // So do the subscriptions the EA app installs, and a method BoilR does not know.
+        assert!(!linked_only(&["STEAM", "XGP_VAULT"]));
+        assert!(!linked_only(&["EPIC", "VAULT"]));
+        assert!(!linked_only(&["STEAM", "SOMETHING_NEW"]));
+
+        // Nothing from a linked store.
+        assert!(!linked_only(&["PURCHASE", "ENTITLEMENT_GRANT"]));
+        assert!(!linked_only(&["ENTITLEMENT_GRANT"]));
+        assert!(!linked_only(&["VAULT"]));
+        assert!(!linked_only(&["XGP_VAULT"]));
+        assert!(!linked_only(&["UNKNOWN"]));
+        assert!(!linked_only(&[]));
     }
 
     #[test]
-    fn other_graphql_errors_are_reported() {
-        let err = parse_owned_games_page(
+    fn only_a_clear_trial_is_left_out() -> eyre::Result<()> {
+        let page = parse_owned_games_page(&fixture("owned_games_trials.json")?)?;
+        let titles: Vec<&str> = page.games.iter().map(|g| g.title.as_str()).collect();
+        // A bought game with a trial on record stays, and so does a trial product the
+        // account also bought. The open trial held by nothing but its grant goes.
+        assert_eq!(titles, vec!["A Way Out", "Bought After The Trial"]);
+
+        let grant = methods(&["ENTITLEMENT_GRANT"]);
+        assert!(is_unowned_trial(true, true, &grant));
+        assert!(is_unowned_trial(true, true, &[]));
+        // Any doubt keeps the game.
+        assert!(!is_unowned_trial(false, true, &grant));
+        assert!(!is_unowned_trial(true, false, &grant));
+        for owned in [
+            &["PURCHASE", "ENTITLEMENT_GRANT"][..],
+            &["VAULT"],
+            &["XGP_VAULT"],
+            &["UNKNOWN"],
+        ] {
+            assert!(!is_unowned_trial(true, true, &methods(owned)), "{owned:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_ownership_method_is_asked_for_once() -> eyre::Result<()> {
+        let url = owned_games_url(FIRST_PAGE)?;
+        let variables: serde_json::Value =
+            serde_json::from_str(&http::query_param(&url, "variables").unwrap_or_default())?;
+        assert_eq!(
+            variables.get("ownershipMethods"),
+            Some(&serde_json::json!(OWNERSHIP_METHODS))
+        );
+        for (i, method) in OWNERSHIP_METHODS.iter().enumerate() {
+            assert!(
+                !OWNERSHIP_METHODS.iter().skip(i + 1).any(|m| m == method),
+                "{method}"
+            );
+        }
+        assert_eq!(
+            OWNERSHIP_METHODS
+                .iter()
+                .filter(|m| is_linked_store(m))
+                .count(),
+            6
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unauthenticated_answer_is_a_refused_login() -> eyre::Result<()> {
+        let body = fixture("not_authenticated.json")?;
+        let refused = parse_owned_games_page(&body);
+        assert!(refused.is_err_and(|e| http::is_login_rejected(&e)));
+        // EA sends it with 401.
+        let refused = graphql_answer(401, &body, parse_owned_games_page);
+        assert!(refused.is_err_and(|e| http::is_login_rejected(&e)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failure_status_is_never_read_as_an_empty_answer() -> eyre::Result<()> {
+        let read = |status: u16, body: &str| graphql_answer(status, body, parse_owned_games_page);
+
+        // JSON that is not a GraphQL answer: the status decides.
+        let unauthorized = read(401, r#"{"message":"Unauthorized"}"#);
+        assert!(unauthorized
+            .is_err_and(|e| http::is_login_rejected(&e) && http::status_of(&e) == Some(401)));
+        let limited = read(429, r#"{"message":"Too many requests"}"#);
+        assert!(limited.is_err_and(|e| http::is_transient(&e) && !http::is_login_rejected(&e)));
+        let down = read(503, "<html>Service Unavailable</html>");
+        assert!(down.is_err_and(|e| http::is_transient(&e)));
+        let blocked = read(403, "<html>Access Denied</html>");
+        assert!(blocked
+            .is_err_and(|e| { http::status_of(&e) == Some(403) && !http::is_login_rejected(&e) }));
+
+        // A GraphQL error with an outage status stays an outage, and with 401 a refused login.
+        let upstream = r#"{"errors":[{"message":"upstream timed out"}],"data":null}"#;
+        let outage = read(502, upstream);
+        assert!(outage.is_err_and(|e| http::is_transient(&e) && !http::is_login_rejected(&e)));
+        let refused = read(401, upstream);
+        assert!(refused.is_err_and(|e| http::is_login_rejected(&e)));
+        // With another status, EA's error is the message.
+        let bad_request = plain_error(read(400, upstream)).unwrap_or_default();
+        assert!(bad_request.contains("upstream timed out"), "{bad_request}");
+
+        // Data that comes with a failure status is not taken as the game list.
+        let page = fixture("owned_games_page1.json")?;
+        assert!(read(500, &page).is_err_and(|e| http::is_transient(&e)));
+        assert!(read(404, &page).is_err());
+        assert_eq!(read(200, &page)?.games.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_persisted_query_asks_for_an_update_not_a_sign_in() {
+        for body in [
+            r#"{"errors":[{"message":"PersistedQueryNotFound","extensions":{"code":"PERSISTED_QUERY_NOT_FOUND"}}]}"#,
             r#"{"data":null,"errors":[{"message":"PersistedQueryNotFound"}]}"#,
-        )
-        .err()
-        .map(|e| e.to_string())
+            r#"{"errors":[{"message":"PersistedQueryNotSupported","extensions":{"code":"PERSISTED_QUERY_NOT_SUPPORTED"}}]}"#,
+        ] {
+            for status in [200, 400] {
+                let message = plain_error(graphql_answer(status, body, parse_owned_games_page))
+                    .unwrap_or_default();
+                assert!(message.contains("BoilR needs an update"), "{message}");
+                assert!(!message.to_lowercase().contains("sign in"), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn graphql_errors_are_reported_with_eas_message() {
+        // No data at all.
+        let none = plain_error(parse_owned_games_page(
+            r#"{"data":null,"errors":[{"message":"Something broke"}]}"#,
+        ))
         .unwrap_or_default();
-        assert!(err.contains("PersistedQueryNotFound"), "{err}");
+        assert!(none.contains("Something broke"), "{none}");
+        // Data without the account in it.
+        let no_account = plain_error(parse_owned_games_page(
+            r#"{"data":{"me":null},"errors":[{"message":"Account lookup failed"}]}"#,
+        ))
+        .unwrap_or_default();
+        assert!(no_account.contains("Account lookup failed"), "{no_account}");
+        let no_list =
+            plain_error(parse_owned_games_page(r#"{"data":{"me":{}}}"#)).unwrap_or_default();
+        assert!(no_list.contains("no data in the answer"), "{no_list}");
+        // Not GraphQL at all.
+        assert!(plain_error(parse_owned_games_page("<html></html>")).is_some());
     }
 
     #[test]
     fn parses_content_ids() -> eyre::Result<()> {
-        let ids = parse_legacy_offers(&fixture("legacy_offers.json"))?;
+        let ids = parse_legacy_offers(&fixture("legacy_offers.json")?)?;
         assert_eq!(ids.len(), 4);
         assert_eq!(
             ids.get("Origin.OFR.50.0002487").map(String::as_str),
@@ -715,12 +1062,48 @@ mod tests {
     }
 
     #[test]
-    fn parses_player_name() {
+    fn a_failed_content_id_batch_ends_the_lookup() -> eyre::Result<()> {
+        let ids: Vec<String> = (0..7).map(|i| i.to_string()).collect();
+        let content_ids = |batch: &[String]| -> HashMap<String, String> {
+            batch
+                .iter()
+                .map(|id| (id.clone(), format!("c{id}")))
+                .collect()
+        };
+
+        let asked = std::cell::Cell::new(0);
+        let (found, failed) = run(lookup_in_batches(&ids, 2, |batch| {
+            asked.set(asked.get() + 1);
+            let fails = asked.get() == 2;
+            async move {
+                if fails {
+                    Err(http::transient("the catalog is down"))
+                } else {
+                    Ok(content_ids(batch))
+                }
+            }
+        }))?;
+        // The third and fourth batch were never asked for.
+        assert_eq!(asked.get(), 2);
+        assert_eq!(found.len(), 2);
+        assert!(failed.is_some_and(|e| http::is_transient(&e)));
+
+        let (found, failed) = run(lookup_in_batches(&ids, 2, |batch| async move {
+            Ok(content_ids(batch))
+        }))?;
+        assert_eq!(found.len(), 7);
+        assert!(failed.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_player_name() -> eyre::Result<()> {
         assert_eq!(
-            parse_player_name(&fixture("player.json")),
+            parse_player_name(&fixture("player.json")?),
             Some("PlayerOne".to_string())
         );
-        assert_eq!(parse_player_name(&fixture("not_authenticated.json")), None);
+        assert_eq!(parse_player_name(&fixture("not_authenticated.json")?), None);
+        Ok(())
     }
 
     #[test]
@@ -747,51 +1130,5 @@ mod tests {
             vec!["Origin.OFR.50.0000001", "OFB-EAST:52735"]
         );
         assert!(manifest_ids("").is_empty());
-    }
-
-    #[test]
-    fn cookie_jar_round_trips_and_refreshes() -> eyre::Result<()> {
-        let captured = vec![
-            cookie("sid", "old", "accounts.ea.com"),
-            cookie("remid", "r", ".ea.com"),
-            cookie("sid", "old", "accounts.ea.com"),
-            cookie("tracker", "t", ".example.com"),
-            cookie("www", "w", "www.ea.com"),
-        ];
-        let mut kept = cookie_jar::keep_domain(&captured, COOKIE_DOMAIN);
-        assert_eq!(kept.len(), 3);
-
-        let (_client, jar) = cookie_jar::client_with(&kept)?;
-        let mut sent = cookie_jar::pairs_for(&jar, ACCOUNTS_HOST);
-        sent.sort();
-        assert_eq!(
-            sent,
-            vec![
-                ("remid".to_string(), "r".to_string()),
-                ("sid".to_string(), "old".to_string())
-            ]
-        );
-        // Host-only cookies stay on their host.
-        assert_eq!(
-            cookie_jar::pairs_for(&jar, "signin.ea.com"),
-            vec![("remid".to_string(), "r".to_string())]
-        );
-
-        // EA renews `sid` (host-only, as it was) and sets a new cookie.
-        let url = url::Url::parse("https://accounts.ea.com/connect/auth")?;
-        jar.add_cookie_str("sid=new; Path=/", &url);
-        jar.add_cookie_str("_nx_mpcid=m; Path=/", &url);
-        assert_eq!(cookie_jar::pairs_for(&jar, ACCOUNTS_HOST).len(), 3);
-        cookie_jar::refresh(&mut kept, &jar, &[ACCOUNTS_HOST]);
-        let value = |name: &str| {
-            kept.iter()
-                .find(|c| c.name == name)
-                .map(|c| c.value.clone())
-        };
-        assert_eq!(value("sid").as_deref(), Some("new"));
-        assert_eq!(value("_nx_mpcid").as_deref(), Some("m"));
-        assert_eq!(value("www").as_deref(), Some("w"));
-        assert_eq!(kept.len(), 4);
-        Ok(())
     }
 }

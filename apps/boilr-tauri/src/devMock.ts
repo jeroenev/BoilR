@@ -66,6 +66,7 @@ const account = (key: string, name: string, extra: Partial<StoreAccount> = {}): 
   code_name: `${key}_account`,
   enabled: false,
   install_with: "auto",
+  heroic_available: true,
   ...extra,
 });
 
@@ -256,16 +257,28 @@ mockIPC(
           fetched_at: null,
           last_error: null,
           needs_sign_in: false,
+          enabled: false,
         });
       case "submit_store_login":
         await delay(800);
-        return updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 12, fetched_at: Math.floor(Date.now() / 1000), enabled: true, last_error: null, needs_sign_in: false });
+        return updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 12, fetched_at: Math.floor(Date.now() / 1000), last_error: null, needs_sign_in: false, notice: "This account owns 12 games. Turn on \"Add every game this account owns\" to add them to Steam." });
       case "open_store_sign_in_page":
         return null;
       case "start_store_login":
+        // Battle.net shows a sign-in that fails.
+        if (a.store === "battlenet") {
+          setTimeout(() => {
+            void emit("store-login", {
+              store: a.store,
+              ok: false,
+              message: "Signing in to Battle.net did not finish: Battle.net says this sign-in is not signed in.",
+            });
+          }, 1500);
+          return null;
+        }
         setTimeout(() => {
-          updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 42, fetched_at: Math.floor(Date.now() / 1000), enabled: true, last_error: null, needs_sign_in: false });
-          void emit("store-login", { store: a.store, ok: true, message: "Signed in as player1" });
+          updateAccount(a.store, { signed_in: true, account_name: "player1", game_count: 42, fetched_at: Math.floor(Date.now() / 1000), last_error: null, needs_sign_in: false });
+          void emit("store-login", { store: a.store, ok: true, message: "Signed in as player1. This account owns 42 games. Turn on \"Add every game this account owns\" to add them to Steam." });
         }, 1500);
         return null;
       case "update_settings":

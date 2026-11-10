@@ -1,10 +1,11 @@
 use boilr_stores::{self as stores, OwnedLibrary, StoreId};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "egui-ui")]
+use super::block_on_fresh;
 use super::{
-    account_code_name, block_on_fresh,
+    account_code_name,
     targets::{owned_shortcut, Launchers},
-    LIBRARY_MAX_AGE_SECS,
 };
 use crate::platforms::{load_settings, GamesPlatform, ShortcutToImport};
 
@@ -52,9 +53,10 @@ impl AccountPlatform {
         }
     }
 
-    /// The cached library, fetched again first when it is older than
-    /// [`LIBRARY_MAX_AGE_SECS`]. A failed fetch falls back to the cached library, so a
-    /// network problem never removes the account's games from Steam.
+    /// The library as it was last fetched. Listing games never waits on a store: front
+    /// ends fetch libraries in the background (see [`super::refresh_stale_libraries`]),
+    /// and a failed fetch keeps the last list, so a network problem never removes the
+    /// account's games from Steam.
     pub fn library(&self) -> eyre::Result<OwnedLibrary> {
         let store = self.store;
         if stores::load_session(store)?.is_none() {
@@ -63,14 +65,14 @@ impl AccountPlatform {
                 store.display_name()
             ));
         }
-        block_on_fresh(stores::refresh_if_stale(store, LIBRARY_MAX_AGE_SECS))?
+        stores::cached_library(store).ok_or_else(|| {
+            eyre::format_err!(
+                "The games of the {} account have not been listed yet. Refresh its library \
+                 from this source's settings.",
+                store.display_name()
+            )
+        })
     }
-}
-
-/// EA lists games the account has through a linked Steam or Epic account too; those belong
-/// to that store (Steam has them already, the Epic account adds them).
-fn include_game(game: &boilr_stores::OwnedGame) -> bool {
-    !matches!(game.extra("access"), Some("steam") | Some("epic"))
 }
 
 impl GamesPlatform for AccountPlatform {
@@ -100,7 +102,6 @@ impl GamesPlatform for AccountPlatform {
         Ok(library
             .games
             .iter()
-            .filter(|game| include_game(game))
             .map(|game| ShortcutToImport {
                 shortcut: owned_shortcut(game, self.settings.install_with, &launchers),
                 needs_proton: false,
@@ -129,8 +130,30 @@ struct Panel {
     status: Option<stores::AccountStatus>,
     busy: bool,
     message: Option<String>,
-    /// A sign-in finished: turn the account on as a source.
+    /// A sign-in finished: the pasted value is no longer needed.
     signed_in: bool,
+    /// A sign-out finished: the account is no longer a source.
+    signed_out: bool,
+}
+
+/// What a background task did to the sign-in.
+#[cfg(feature = "egui-ui")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Unchanged,
+    SignedIn,
+    SignedOut,
+}
+
+/// What signing in found, and how to add it: signing in alone adds nothing to Steam.
+#[cfg(feature = "egui-ui")]
+fn games_to_add(store: StoreId) -> String {
+    match stores::cached_library(store).map(|library| library.games.len()) {
+        Some(count) => {
+            format!("This account owns {count} games. Tick the box above to add them to Steam.")
+        }
+        None => "Its games could not be listed yet; use Refresh library.".to_string(),
+    }
 }
 
 #[cfg(feature = "egui-ui")]
@@ -143,10 +166,10 @@ fn lock_panel(panel: &std::sync::Mutex<Panel>) -> std::sync::MutexGuard<'_, Pane
 #[cfg(feature = "egui-ui")]
 impl AccountPlatform {
     /// Runs `work` on a background thread; its message shows in the panel when it is done.
-    /// `work` returns the message and whether the account is now signed in.
+    /// `work` returns the message and what happened to the sign-in.
     fn run_in_background<F>(&self, ctx: &egui::Context, work: F)
     where
-        F: FnOnce() -> (String, bool) + Send + 'static,
+        F: FnOnce() -> (String, Outcome) + Send + 'static,
     {
         {
             let mut panel = lock_panel(&self.panel);
@@ -159,12 +182,13 @@ impl AccountPlatform {
         let panel = self.panel.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let (message, signed_in) = work();
+            let (message, outcome) = work();
             {
                 let mut panel = lock_panel(&panel);
                 panel.busy = false;
                 panel.message = Some(message);
-                panel.signed_in |= signed_in;
+                panel.signed_in |= outcome == Outcome::SignedIn;
+                panel.signed_out |= outcome == Outcome::SignedOut;
                 panel.status = None;
             }
             ctx.request_repaint();
@@ -179,8 +203,12 @@ impl AccountPlatform {
             let mut panel = lock_panel(&self.panel);
             if panel.signed_in {
                 panel.signed_in = false;
-                self.settings.enabled = true;
                 self.pasted.clear();
+            }
+            if panel.signed_out {
+                // A source without a sign-in would only report an error on every sync.
+                panel.signed_out = false;
+                self.settings.enabled = false;
             }
             let status = panel
                 .status
@@ -226,17 +254,18 @@ impl AccountPlatform {
                                 Ok(Ok(library)) => format!("Found {} games.", library.games.len()),
                                 Ok(Err(err)) | Err(err) => format!("Could not refresh: {err}"),
                             };
-                            (message, false)
+                            (message, Outcome::Unchanged)
                         });
                     }
                     if ui.button("Sign out").clicked() {
                         self.run_in_background(ui.ctx(), move || {
-                            let message = match block_on_fresh(stores::sign_out(store)) {
-                                Ok(Ok(None)) => "Signed out.".to_string(),
-                                Ok(Ok(Some(warning))) => warning,
-                                Ok(Err(err)) | Err(err) => format!("Could not sign out: {err}"),
-                            };
-                            (message, false)
+                            match block_on_fresh(stores::sign_out(store)) {
+                                Ok(Ok(None)) => ("Signed out.".to_string(), Outcome::SignedOut),
+                                Ok(Ok(Some(warning))) => (warning, Outcome::SignedOut),
+                                Ok(Err(err)) | Err(err) => {
+                                    (format!("Could not sign out: {err}"), Outcome::Unchanged)
+                                }
+                            }
                         });
                     }
                 });
@@ -244,11 +273,18 @@ impl AccountPlatform {
         } else {
             match &status.manual {
                 ManualLogin::Paste {
-                    url,
                     instructions,
                     placeholder,
+                    ..
                 } => {
-                    ui.hyperlink_to("Open the sign-in page in your browser", url);
+                    // The link comes from the login in progress, not from the status: a
+                    // store's link can be tied to the login that finishes it.
+                    if ui.link("Open the sign-in page in your browser").clicked() {
+                        if let ManualLogin::Paste { url, .. } = stores::pending_login(store).manual
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        }
+                    }
                     ui.label(instructions);
                     ui.horizontal(|ui| {
                         ui.add(
@@ -280,13 +316,17 @@ impl AccountPlatform {
                                     match signed_in {
                                         Ok(name) => (
                                             format!(
-                                                "Signed in{}.",
+                                                "Signed in{}. {}",
                                                 name.map(|n| format!(" as {n}"))
-                                                    .unwrap_or_default()
+                                                    .unwrap_or_default(),
+                                                games_to_add(store)
                                             ),
-                                            true,
+                                            Outcome::SignedIn,
                                         ),
-                                        Err(err) => (format!("Could not sign in: {err}"), false),
+                                        Err(err) => (
+                                            format!("Could not sign in: {err}"),
+                                            Outcome::Unchanged,
+                                        ),
                                     }
                                 });
                             }

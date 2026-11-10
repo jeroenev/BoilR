@@ -105,28 +105,45 @@ pub fn identity_ids(identity: &str) -> Vec<String> {
         .collect()
 }
 
-/// The app id of a shortcut for a game that is not installed. These shortcuts share their
-/// exe (`xdg-open`, a store launcher) and often their name (one game owned in two stores),
-/// so the usual `exe + name` hash would give two games one app id; the identity tells them
-/// apart. Steam reads the app id from `shortcuts.vdf`.
-pub fn owned_app_id(exe: &str, name: &str, identity: &str) -> u32 {
-    calculate_app_id(exe, &format!("{name}\u{0}{}", identity_key(identity)))
+/// What [`owned_app_id`] hashes next to the identity, in place of an exe.
+const OWNED_APP_ID_SEED: &str = "boilr-owned";
+
+/// The app id of a shortcut for a game that is not installed: a hash of its identity alone
+/// (of its first id, see [`identity_key`]). These shortcuts share their exe (`xdg-open`, a
+/// store launcher) and often their name (one game owned in two stores), so the usual
+/// `exe + name` hash would give two games one app id. And their exe changes when the user
+/// installs a launcher or picks another way to open them, while the id must stay: BoilR's
+/// hidden games and renames are keyed by it. Steam reads the app id from `shortcuts.vdf`.
+pub fn owned_app_id(identity: &str) -> u32 {
+    calculate_app_id(OWNED_APP_ID_SEED, identity_key(identity))
 }
 
-/// Whether the shortcut's app id was made by [`owned_app_id`], so it is made the same way
-/// again when its exe or name changes.
-fn has_owned_app_id(shortcut: &ShortcutOwned) -> bool {
-    identity_of(shortcut).is_some_and(|identity| {
-        shortcut.app_id == owned_app_id(&shortcut.exe, &shortcut.app_name, identity)
-    })
+/// Whether the shortcut's app id was made by [`owned_app_id`]. Such an id stays as it is
+/// when the shortcut's exe or name changes.
+pub fn has_owned_app_id(shortcut: &ShortcutOwned) -> bool {
+    identity_of(shortcut).is_some_and(|identity| shortcut.app_id == owned_app_id(identity))
 }
 
-/// Recomputes the app id after the exe or name changed, the same way it was made.
-fn recompute_app_id(shortcut: &mut ShortcutOwned, owned: bool) {
-    shortcut.app_id = match identity_of(shortcut).filter(|_| owned) {
-        Some(identity) => owned_app_id(&shortcut.exe, &shortcut.app_name, identity),
-        None => calculate_app_id(&shortcut.exe, &shortcut.app_name),
-    };
+/// The app id a shortcut has once its exe or name changed: the same for a game that is not
+/// installed, the `exe + name` hash for every other.
+pub fn app_id_after_change(shortcut: &ShortcutOwned) -> u32 {
+    if has_owned_app_id(shortcut) {
+        shortcut.app_id
+    } else {
+        calculate_app_id(&shortcut.exe, &shortcut.app_name)
+    }
+}
+
+/// The user's own name for a game. Renames are keyed by the app id the platform reports. A
+/// game with an identity is also found under the id it had while it was not installed, so
+/// a rename made then still applies once the game is installed.
+pub fn rename_for<'a>(
+    shortcut: &ShortcutOwned,
+    renames: &'a HashMap<u32, String>,
+) -> Option<&'a String> {
+    renames
+        .get(&shortcut.app_id)
+        .or_else(|| identity_of(shortcut).and_then(|identity| renames.get(&owned_app_id(identity))))
 }
 
 pub fn sync_shortcuts(
@@ -177,12 +194,16 @@ pub fn sync_shortcuts_with_collections(
     let mut previous_ids = HashMap::new();
     for shortcut in &mut all_shortcuts {
         // Renames are keyed by the platform's app id, so look up before the Flatpak rewrite.
-        let rename = renames.get(&shortcut.app_id);
+        let rename = rename_for(shortcut, renames);
+        // Whether this is a game that is not installed, whose id stays, is told from the id
+        // the platform gave it: decide before anything changes.
         let owned = has_owned_app_id(shortcut);
         if flatpak_steam {
             let id_before = shortcut.app_id;
             run_flatpak_on_host(shortcut);
-            recompute_app_id(shortcut, owned);
+            if !owned {
+                shortcut.app_id = calculate_app_id(&shortcut.exe, &shortcut.app_name);
+            }
             if shortcut.app_id != id_before {
                 previous_ids.insert(shortcut.app_id, id_before);
             }
@@ -190,8 +211,12 @@ pub fn sync_shortcuts_with_collections(
         if let Some(rename) = rename {
             let original_id = shortcut.app_id;
             shortcut.app_name = rename.clone();
-            recompute_app_id(shortcut, owned);
-            previous_ids.insert(shortcut.app_id, original_id);
+            if !owned {
+                shortcut.app_id = calculate_app_id(&shortcut.exe, &shortcut.app_name);
+            }
+            if shortcut.app_id != original_id {
+                previous_ids.insert(shortcut.app_id, original_id);
+            }
         }
     }
     let mut collections: Vec<(String, Vec<u32>)> = platform_shortcuts
@@ -264,15 +289,27 @@ pub fn sync_shortcuts_with_collections(
 /// A game with an identity keeps the app id Steam already knows it by, even when its
 /// target changed (an owned game that got installed launches the game instead of the
 /// store's installer, so exe and with it the computed id change). Steam reads the app id
-/// from `shortcuts.vdf`; artwork in `grid/` and playtime are keyed by it. Identities are
-/// compared by their first id ([`identity_key`]).
+/// from `shortcuts.vdf`; artwork in `grid/` and playtime are keyed by it.
+///
+/// Two identities are the same game when any of their ids match ([`identity_ids`]): an
+/// installed EA game lists every offer in its manifest, and the account may own it under
+/// any of them. A match on a shortcut's first id is preferred.
 fn keep_identity_app_ids(existing: &[ShortcutOwned], new_shortcuts: &mut [ShortcutOwned]) {
-    let mut existing_by_identity: HashMap<&str, u32> = HashMap::new();
-    for old in existing {
-        if let Some(identity) = identity_of(old) {
-            existing_by_identity
-                .entry(identity_key(identity))
-                .or_insert(old.app_id);
+    let mut existing_by_id: HashMap<String, u32> = HashMap::new();
+    // First ids go in before the other ids, so a game's own id wins over an id another
+    // game merely lists.
+    for first_ids_only in [true, false] {
+        for old in existing {
+            let Some(identity) = identity_of(old) else {
+                continue;
+            };
+            let mut ids = identity_ids(identity);
+            if first_ids_only {
+                ids.truncate(1);
+            }
+            for id in ids {
+                existing_by_id.entry(id).or_insert(old.app_id);
+            }
         }
     }
     let mut taken: HashSet<u32> = new_shortcuts.iter().map(|s| s.app_id).collect();
@@ -280,7 +317,10 @@ fn keep_identity_app_ids(existing: &[ShortcutOwned], new_shortcuts: &mut [Shortc
         let Some(identity) = identity_of(shortcut) else {
             continue;
         };
-        let Some(&kept_id) = existing_by_identity.get(identity_key(identity)) else {
+        let Some(kept_id) = identity_ids(identity)
+            .iter()
+            .find_map(|id| existing_by_id.get(id).copied())
+        else {
             continue;
         };
         if kept_id == shortcut.app_id || taken.contains(&kept_id) {
@@ -298,11 +338,12 @@ fn map_collection_ids(
     collections
         .iter()
         .map(|(name, ids)| {
-            let mut mapped: Vec<u32> = ids
+            let mut seen = HashSet::new();
+            let mapped: Vec<u32> = ids
                 .iter()
                 .filter_map(|id| final_ids.get(id).copied())
+                .filter(|id| seen.insert(*id))
                 .collect();
-            mapped.dedup();
             (name.clone(), mapped)
         })
         .collect()
@@ -465,8 +506,11 @@ fn write_shortcut_collections<S: AsRef<str>>(
 }
 
 /// Writes to a temporary file next to `shortcuts.vdf` and renames it over the original, so
-/// a crash or a full disk never leaves Steam with half a file.
+/// a crash or a full disk never leaves Steam with half a file. A `shortcuts.vdf` that is a
+/// symlink keeps being one: the file it points to is the one replaced.
 fn save_shortcuts(shortcuts: &[ShortcutOwned], path: &Path) -> Result<(), String> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = target.as_path();
     let mut shortcuts_refs = vec![];
     for shortcut in shortcuts {
         shortcuts_refs.push(shortcut.borrow());
@@ -510,7 +554,7 @@ mod tests {
     fn owned(name: &str, exe: &str, store: &str, id: &str) -> ShortcutOwned {
         let mut shortcut = shortcut(name, exe);
         shortcut.dev_kit_game_id = shortcut_identity(store, id);
-        shortcut.app_id = owned_app_id(exe, name, &format!("{store}:{id}"));
+        shortcut.app_id = owned_app_id(&format!("{store}:{id}"));
         shortcut
     }
 
@@ -538,18 +582,81 @@ mod tests {
         assert!(!has_owned_app_id(&shortcut("Fallout 3", "xdg-open")));
         // Other ids of the same game don't move the app id.
         assert_eq!(
-            owned_app_id("xdg-open", "Game", "ea:OFB-EAST:1"),
-            owned_app_id("xdg-open", "Game", "ea:OFB-EAST:1,1002139")
+            owned_app_id("ea:OFB-EAST:1"),
+            owned_app_id("ea:OFB-EAST:1,1002139")
         );
     }
 
     #[test]
-    fn renamed_owned_game_keeps_an_identity_app_id() {
+    fn a_game_that_is_not_installed_keeps_its_app_id_whatever_changes() {
         let mut game = owned("Fallout 3", "xdg-open", "gog", "1");
+        let id = game.app_id;
+        // A rename, another launcher: the id is a hash of the identity alone.
         game.app_name = "Fallout III".to_string();
-        recompute_app_id(&mut game, true);
+        game.exe = "\"C:\\GOG Galaxy\\GalaxyClient.exe\"".to_string();
+        assert_eq!(app_id_after_change(&game), id);
         assert!(has_owned_app_id(&game));
-        assert_ne!(game.app_id, calculate_app_id("xdg-open", "Fallout III"));
+        assert_ne!(id, calculate_app_id("xdg-open", "Fallout 3"));
+
+        // An installed game is still hashed from exe and name.
+        let mut installed = shortcut("Game", "/games/game");
+        installed.dev_kit_game_id = shortcut_identity("gog", "1");
+        installed.app_name = "Renamed".to_string();
+        assert_eq!(
+            app_id_after_change(&installed),
+            calculate_app_id("/games/game", "Renamed")
+        );
+    }
+
+    #[test]
+    fn a_rename_made_before_a_game_was_installed_still_applies() {
+        let owned_game = owned("Game", "xdg-open", "gog", "1");
+        let mut installed = shortcut("Game", "/games/game");
+        installed.dev_kit_game_id = shortcut_identity("gog", "1");
+        let other = shortcut("Game", "/games/other");
+
+        let renames = HashMap::from([(owned_game.app_id, "My Game".to_string())]);
+        assert_eq!(
+            rename_for(&owned_game, &renames).map(String::as_str),
+            Some("My Game")
+        );
+        assert_eq!(
+            rename_for(&installed, &renames).map(String::as_str),
+            Some("My Game")
+        );
+        assert_eq!(rename_for(&other, &renames), None);
+        // A rename of the installed game itself comes first.
+        let renames = HashMap::from([
+            (owned_game.app_id, "Old".to_string()),
+            (installed.app_id, "New".to_string()),
+        ]);
+        assert_eq!(
+            rename_for(&installed, &renames).map(String::as_str),
+            Some("New")
+        );
+    }
+
+    #[test]
+    fn an_installed_game_found_under_another_of_its_ids_keeps_the_app_id() {
+        // Steam has the game as the account lists it; the installed copy's manifest names
+        // that offer second.
+        let mut old = shortcut("Game", "/usr/bin/xdg-open");
+        old.dev_kit_game_id = shortcut_identity("ea", "OFB-EAST:2,1002139");
+        let old_id = old.app_id;
+        let mut other = shortcut("Other", "/usr/bin/xdg-open");
+        other.dev_kit_game_id = shortcut_identity("ea", "OFB-EAST:1");
+        let other_id = other.app_id;
+        let mut installed = shortcut("Game", "/games/game.exe");
+        installed.dev_kit_game_id = shortcut_identity("ea", "OFB-EAST:9,OFB-EAST:2");
+        // A game whose own id another game merely lists keeps its own.
+        let mut listed_first = shortcut("Other", "/games/other.exe");
+        listed_first.dev_kit_game_id = shortcut_identity("ea", "OFB-EAST:1,OFB-EAST:2");
+        let mut new_shortcuts = vec![installed, listed_first];
+
+        keep_identity_app_ids(&[old, other], &mut new_shortcuts);
+
+        let ids: Vec<u32> = new_shortcuts.iter().map(|s| s.app_id).collect();
+        assert_eq!(ids, vec![old_id, other_id]);
     }
 
     #[test]
@@ -676,8 +783,9 @@ mod tests {
 
     #[test]
     fn collections_follow_the_final_app_ids() {
-        let collections = vec![("Not installed".to_string(), vec![1, 2, 3])];
-        let final_ids = HashMap::from([(1, 10), (2, 2)]);
+        // Two ids that end up the same are listed once, wherever they stand.
+        let collections = vec![("Not installed".to_string(), vec![1, 2, 3, 4])];
+        let final_ids = HashMap::from([(1, 10), (2, 2), (4, 10)]);
 
         let mapped = map_collection_ids(&collections, &final_ids);
 

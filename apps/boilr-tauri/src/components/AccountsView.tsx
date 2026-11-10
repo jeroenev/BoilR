@@ -126,7 +126,11 @@ const AccountCard = ({
           </div>
           <div className="mt-2 divide-y-2 divide-harbour/60">
             <SettingRow
-              title="Add every game this account owns"
+              title={
+                account.game_count == null
+                  ? "Add every game this account owns"
+                  : `Add every game this account owns (${account.game_count})`
+              }
               hint="Games that are not installed get a shortcut that installs them, and go into the Steam collection “Not installed”."
             >
               <Toggle
@@ -153,11 +157,13 @@ const AccountCard = ({
                   )
                 }
               >
-                {(Object.keys(INSTALL_WITH_LABELS) as InstallWith[]).map((value) => (
-                  <option key={value} value={value}>
-                    {INSTALL_WITH_LABELS[value]}
-                  </option>
-                ))}
+                {(Object.keys(INSTALL_WITH_LABELS) as InstallWith[])
+                  .filter((value) => value !== "heroic" || account.heroic_available || account.install_with === "heroic")
+                  .map((value) => (
+                    <option key={value} value={value}>
+                      {INSTALL_WITH_LABELS[value]}
+                    </option>
+                  ))}
               </select>
             </label>
           </div>
@@ -215,8 +221,11 @@ export const AccountsView = ({
   onAccountsChanged,
   loginResult,
   onLoginResultSeen,
+  librariesVersion,
 }: {
   onAccountsChanged: () => void;
+  /** Goes up when libraries were fetched again in the background: the accounts are read again. */
+  librariesVersion: number;
   /** The last login window result, caught by App so none is missed while this view is closed. */
   loginResult: LoginResult | null;
   onLoginResultSeen: () => void;
@@ -240,7 +249,7 @@ export const AccountsView = ({
 
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, librariesVersion]);
 
   // App refreshes the games itself; this view shows the result and reloads the accounts.
   useEffect(() => {

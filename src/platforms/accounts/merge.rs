@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::platforms::ShortcutToImport;
 use crate::sync::{identity_ids, identity_key, identity_of};
@@ -7,69 +7,44 @@ use crate::sync::{identity_ids, identity_key, identity_of};
 pub const NOT_INSTALLED_COLLECTION: &str = "Not installed";
 
 /// Drops owned (not installed) entries for games that an installed-games platform also
-/// reports: the installed shortcut wins, and the sync keeps the app id Steam knew the owned
-/// entry by. Also drops repeated owned entries of the same game.
+/// reports: the installed shortcut wins. Also drops repeated owned entries of the same game.
 ///
 /// Identities can name several ids of one game (see [`crate::sync::identity_ids`]); an
-/// owned and an installed entry are the same game when any of their ids match. The
-/// installed entry then takes the owned entry's identity, so the sync finds the app id the
-/// owned shortcut had even when the installed copy reports the game under another id.
+/// owned and an installed entry are the same game when any of their ids match. The sync
+/// finds the app id Steam knew the owned entry by in the same way, so the installed entry
+/// keeps its own identity.
 pub fn drop_owned_duplicates<'a, I>(lists: I)
 where
     I: IntoIterator<Item = &'a mut Vec<ShortcutToImport>>,
 {
     let mut lists: Vec<&mut Vec<ShortcutToImport>> = lists.into_iter().collect();
 
-    // Every id of an installed game, and where that game is.
-    let mut installed: HashMap<String, (usize, usize)> = HashMap::new();
-    for (list_index, list) in lists.iter().enumerate() {
-        for (entry_index, entry) in list.iter().enumerate() {
-            let Some(identity) = identity_of(&entry.shortcut).filter(|_| entry.installed) else {
-                continue;
-            };
-            for id in identity_ids(identity) {
-                installed.entry(id).or_insert((list_index, entry_index));
-            }
-        }
-    }
-
-    let mut seen_owned: HashSet<String> = HashSet::new();
-    let mut adopted: Vec<((usize, usize), String)> = Vec::new();
-    let keep: Vec<Vec<bool>> = lists
+    // Every id of every installed game.
+    let installed: HashSet<String> = lists
         .iter()
-        .map(|list| {
-            list.iter()
-                .map(|entry| {
-                    let Some(identity) = identity_of(&entry.shortcut) else {
-                        return true;
-                    };
-                    if entry.installed {
-                        return true;
-                    }
-                    let installed_copy = identity_ids(identity)
-                        .iter()
-                        .find_map(|id| installed.get(id).copied());
-                    if let Some(at) = installed_copy {
-                        adopted.push((at, entry.shortcut.dev_kit_game_id.clone()));
-                        return false;
-                    }
-                    seen_owned.insert(identity_key(identity).to_string())
-                })
-                .collect()
-        })
+        .flat_map(|list| list.iter())
+        .filter(|entry| entry.installed)
+        .filter_map(|entry| identity_of(&entry.shortcut))
+        .flat_map(identity_ids)
         .collect();
 
-    for ((list_index, entry_index), dev_kit_game_id) in adopted {
-        if let Some(entry) = lists
-            .get_mut(list_index)
-            .and_then(|list| list.get_mut(entry_index))
-        {
-            entry.shortcut.dev_kit_game_id = dev_kit_game_id;
-        }
-    }
-    for (list, keep) in lists.iter_mut().zip(keep) {
-        let mut keep = keep.into_iter();
-        list.retain(|_| keep.next().unwrap_or(true));
+    let mut seen_owned: HashSet<String> = HashSet::new();
+    for list in lists.iter_mut() {
+        list.retain(|entry| {
+            let Some(identity) = identity_of(&entry.shortcut) else {
+                return true;
+            };
+            if entry.installed {
+                return true;
+            }
+            if identity_ids(identity)
+                .iter()
+                .any(|id| installed.contains(id))
+            {
+                return false;
+            }
+            seen_owned.insert(identity_key(identity).to_string())
+        });
     }
 }
 
@@ -126,13 +101,10 @@ mod tests {
     }
 
     #[test]
-    fn installed_copy_found_under_another_id_takes_the_owned_identity() {
+    fn installed_copy_found_under_another_id_replaces_the_owned_entry() {
         // The EA manifest lists two offers; the account owns the game under the second.
-        let mut installed = vec![entry(
-            "Installed",
-            Some("boilr:ea:Origin.OFR.50.0000001,OFB-EAST:52735"),
-            true,
-        )];
+        let installed_identity = "boilr:ea:Origin.OFR.50.0000001,OFB-EAST:52735";
+        let mut installed = vec![entry("Installed", Some(installed_identity), true)];
         let mut owned = vec![
             entry("Owned copy", Some("boilr:ea:OFB-EAST:52735,1002139"), false),
             entry("Other", Some("boilr:ea:OFB-EAST:1"), false),
@@ -141,11 +113,13 @@ mod tests {
         drop_owned_duplicates([&mut owned, &mut installed]);
 
         assert_eq!(names(&owned), ["Other"]);
+        // The installed game keeps its own identity; the sync matches it to the owned
+        // shortcut in Steam by the id they share.
         assert_eq!(
             installed
                 .first()
                 .map(|e| e.shortcut.dev_kit_game_id.as_str()),
-            Some("boilr:ea:OFB-EAST:52735,1002139")
+            Some(installed_identity)
         );
     }
 

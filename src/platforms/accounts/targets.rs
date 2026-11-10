@@ -91,7 +91,7 @@ pub(crate) fn owned_shortcut(
     )
     .to_owned();
     let identity = owned_identity(game);
-    shortcut.app_id = crate::sync::owned_app_id(&shortcut.exe, &shortcut.app_name, &identity);
+    shortcut.app_id = crate::sync::owned_app_id(&identity);
     shortcut.dev_kit_game_id = format!("{}{identity}", crate::sync::IDENTITY_PREFIX);
     shortcut.tags.push(store_tag(game.store).to_owned());
     shortcut.tags.push("Not installed".to_owned());
@@ -163,10 +163,9 @@ fn launcher_target(game: &OwnedGame, launchers: &Launchers) -> Option<Target> {
         }
         StoreId::BattleNet => {
             let launcher = launchers.battlenet.as_ref()?;
-            // Classic CD-key games (Warcraft III, Diablo II) have no launcher install.
-            let internal_id = game
-                .extra("internal_id")
-                .filter(|_| game.extra("launcher") != Some("false"))?;
+            // Games the launcher cannot install (classic CD-key games, titles BoilR does
+            // not know yet) have no internal id.
+            let internal_id = game.extra("internal_id")?;
             Some(Target {
                 exe: quoted(launcher),
                 start_dir: parent_dir(launcher),
@@ -216,6 +215,8 @@ fn heroic_target(game: &OwnedGame, launchers: &Launchers) -> Option<Target> {
     if !launchers.heroic_stores.contains(&game.store) {
         return None;
     }
+    // With the runner, unlike the link of an installed Heroic game
+    // (`heroic://launch/<app>`): Heroic has to know which store to install from.
     let link = format!("heroic://launch/{runner}/{}", game.id);
     match launchers.heroic.as_ref()? {
         Heroic::Flatpak => Some(Target {
@@ -224,7 +225,11 @@ fn heroic_target(game: &OwnedGame, launchers: &Launchers) -> Option<Target> {
             launch_options: format!("run com.heroicgameslauncher.hgl {link} --no-gui --no-sandbox"),
         }),
         Heroic::Native(path) => Some(Target {
-            exe: quoted(path),
+            exe: if path.is_absolute() {
+                quoted(path)
+            } else {
+                path.to_string_lossy().to_string()
+            },
             start_dir: String::new(),
             launch_options: link,
         }),
@@ -426,24 +431,41 @@ fn detect_heroic() -> Option<Heroic> {
     if cfg!(windows) {
         return None;
     }
-    if let Some(path) = find_in_path("heroic") {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let installed_natively =
+        find_in_path("heroic").or_else(|| first_existing([PathBuf::from("/opt/Heroic/heroic")]));
+    heroic_install(installed_natively, |path| path.exists(), home.as_deref())
+}
+
+/// Which Heroic is there. `exists` tells whether a path is there, so tests need no files.
+///
+/// Inside BoilR's own Flatpak neither the host's `PATH` nor `/var/lib/flatpak` (where a
+/// system-wide Heroic Flatpak lives, the usual place on SteamOS) can be seen. What can be
+/// seen is the folder a Flatpak app keeps its data in, `~/.var/app/<id>`: it is there once
+/// the Heroic Flatpak has run, however it was installed.
+fn heroic_install(
+    native: Option<PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+    home: Option<&Path>,
+) -> Option<Heroic> {
+    if let Some(path) = native {
         return Some(Heroic::Native(path));
     }
-    if let Some(path) = first_existing([PathBuf::from("/opt/Heroic/heroic")]) {
-        return Some(Heroic::Native(path));
+    const FLATPAK_ID: &str = "com.heroicgameslauncher.hgl";
+    let mut flatpak_signs = vec![PathBuf::from("/var/lib/flatpak/app").join(FLATPAK_ID)];
+    if let Some(home) = home {
+        flatpak_signs.push(home.join(".local/share/flatpak/app").join(FLATPAK_ID));
+        flatpak_signs.push(home.join(".var/app").join(FLATPAK_ID));
     }
-    let flatpak_installed = [
-        std::env::var_os("HOME").map(|home| {
-            Path::new(&home).join(".local/share/flatpak/app/com.heroicgameslauncher.hgl")
-        }),
-        Some(PathBuf::from(
-            "/var/lib/flatpak/app/com.heroicgameslauncher.hgl",
-        )),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|path| path.exists());
-    flatpak_installed.then_some(Heroic::Flatpak)
+    if flatpak_signs.iter().any(|path| exists(path)) {
+        return Some(Heroic::Flatpak);
+    }
+    // A native Heroic that BoilR's Flatpak cannot find in the host's `PATH` still shows by
+    // its config folder; Steam runs the shortcut on the host, where `heroic` is found.
+    let native_config = home.map(|home| home.join(".config/heroic"));
+    native_config
+        .filter(|path| exists(path))
+        .map(|_| Heroic::Native(PathBuf::from("heroic")))
 }
 
 /// Heroic keeps a sign-in file per store (Legendary, GOG, Nile), natively or in its Flatpak.
@@ -582,6 +604,54 @@ mod tests {
     }
 
     #[test]
+    fn heroic_is_found_from_inside_a_flatpak() {
+        let home = Path::new("/home/deck");
+        let only = |there: &'static str| move |path: &Path| path == Path::new(there);
+        // A system-wide Heroic Flatpak, seen from BoilR's own Flatpak: only its data folder.
+        assert_eq!(
+            heroic_install(
+                None,
+                only("/home/deck/.var/app/com.heroicgameslauncher.hgl"),
+                Some(home)
+            ),
+            Some(Heroic::Flatpak)
+        );
+        // Seen from the host.
+        assert_eq!(
+            heroic_install(
+                None,
+                only("/var/lib/flatpak/app/com.heroicgameslauncher.hgl"),
+                Some(home)
+            ),
+            Some(Heroic::Flatpak)
+        );
+        // A native Heroic whose binary cannot be seen runs by name on the host.
+        assert_eq!(
+            heroic_install(None, only("/home/deck/.config/heroic"), Some(home)),
+            Some(Heroic::Native(PathBuf::from("heroic")))
+        );
+        assert_eq!(
+            heroic_install(
+                Some(PathBuf::from("/usr/bin/heroic")),
+                |_: &Path| true,
+                Some(home)
+            ),
+            Some(Heroic::Native(PathBuf::from("/usr/bin/heroic")))
+        );
+        assert_eq!(heroic_install(None, |_: &Path| false, Some(home)), None);
+
+        let launchers = Launchers {
+            heroic: Some(Heroic::Native(PathBuf::from("heroic"))),
+            heroic_stores: vec![StoreId::Gog],
+            ..linux()
+        };
+        assert_eq!(
+            target(&game(StoreId::Gog, "1"), InstallWith::Auto, &launchers).exe,
+            "heroic"
+        );
+    }
+
+    #[test]
     fn browser_setting_skips_launchers() {
         let launchers = Launchers {
             galaxy: Some(PathBuf::from("C:\\GOG Galaxy\\GalaxyClient.exe")),
@@ -614,9 +684,7 @@ mod tests {
             target(&overwatch, InstallWith::Auto, &launchers).launch_options,
             "--game=prometheus"
         );
-        let classic = game(StoreId::BattleNet, "W3")
-            .with_extra("internal_id", "w3")
-            .with_extra("launcher", "false");
+        let classic = game(StoreId::BattleNet, "W3");
         assert_eq!(
             target(&classic, InstallWith::Auto, &launchers).launch_options,
             "\"https://download.battle.net/\""

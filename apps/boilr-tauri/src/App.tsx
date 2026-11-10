@@ -181,6 +181,27 @@ const App = () => {
     };
   }, [refreshAfterAccountChange]);
 
+  // Libraries that got old are fetched again in the background after the app starts. The
+  // game list shows what was last fetched and is read again once new lists are in.
+  const [librariesVersion, setLibrariesVersion] = useState(0);
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    listen<string[]>("store-libraries-refreshed", () => {
+      if (!active) return;
+      setLibrariesVersion((version) => version + 1);
+      refreshAfterAccountChange();
+    })
+      .then((stop) => {
+        unlisten = stop;
+      })
+      .catch((err) => console.error("Failed to listen for refreshed libraries", err));
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [refreshAfterAccountChange]);
+
   const updateSettings = useCallback(
     async (patch: SettingsUpdatePayload) => {
       setSettingsError(null);
@@ -390,6 +411,7 @@ const App = () => {
             onAccountsChanged={refreshAfterAccountChange}
             loginResult={loginResult}
             onLoginResultSeen={clearLoginResult}
+            librariesVersion={librariesVersion}
           />
         ) : view === "artwork" ? (
           <ArtworkView settings={settings} onSettingsChanged={setSettings} />
