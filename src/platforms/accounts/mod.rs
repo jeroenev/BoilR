@@ -8,13 +8,15 @@
 //! [`drop_owned_duplicates`] then drops the owned entry, and the sync keeps the Steam app id
 //! the game already had (see `boilr_core::sync::keep_identity_app_ids`).
 
+mod arrange;
 mod merge;
 mod platform;
 mod targets;
 
+pub use arrange::{arrange_owned, arrange_owned_games, steam_titles, Arranged};
 pub use boilr_stores::{self as stores, StoreId};
 pub use merge::{drop_owned_duplicates, not_installed_collection, NOT_INSTALLED_COLLECTION};
-pub use platform::{AccountPlatform, AccountSettings, InstallWith};
+pub use platform::{is_prerelease, AccountPlatform, AccountSettings, InstallWith};
 pub use targets::describe_install_target;
 
 /// Libraries older than this are fetched again by [`refresh_stale_libraries`].

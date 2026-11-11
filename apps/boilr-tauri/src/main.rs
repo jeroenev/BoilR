@@ -12,7 +12,7 @@ use std::{
 use boilr::{
     backups::backup_shortcuts,
     platforms::{
-        accounts::{drop_owned_duplicates, not_installed_collection},
+        accounts::{arrange_owned, not_installed_collection},
         get_platform_shortcuts, get_platforms, GamesPlatform, ShortcutToImport,
     },
     renames::{load_rename_map, set_rename},
@@ -198,6 +198,31 @@ fn update_settings(update: SettingsUpdate) -> Result<Settings, String> {
         }
         if let Some(value) = grid.auth_key {
             settings.steamgrid_db.auth_key = value;
+        }
+        if let Some(value) = grid.match_by_store_id {
+            settings.steamgrid_db.match_by_store_id = value;
+        }
+    }
+
+    if let Some(owned) = update.owned_games {
+        let current = &mut settings.owned_games;
+        if let Some(value) = owned.skip_games_in_steam {
+            current.skip_games_in_steam = value;
+        }
+        if let Some(value) = owned.skip_installed_elsewhere {
+            current.skip_installed_elsewhere = value;
+        }
+        if let Some(value) = owned.multi_store {
+            current.multi_store = value;
+        }
+        if let Some(value) = owned.store_order {
+            current.store_order = value;
+        }
+        if let Some(value) = owned.name_label {
+            current.name_label = value;
+        }
+        if let Some(value) = owned.confirm_above {
+            current.confirm_above = value;
         }
     }
 
@@ -466,12 +491,19 @@ fn gather_platform_snapshots() -> Vec<PlatformSnapshot> {
         }
     }
 
-    // An owned game that is installed shows up once, as the installed game.
-    drop_owned_duplicates(
-        snapshots
-            .iter_mut()
-            .filter_map(|snapshot| snapshot.shortcuts.as_mut()),
-    );
+    // Which games that are not installed go in, and under what name ([owned_games]). An
+    // owned game that is installed shows up once, as the installed game.
+    match Settings::new() {
+        Ok(settings) => {
+            arrange_owned(
+                snapshots
+                    .iter_mut()
+                    .filter_map(|snapshot| snapshot.shortcuts.as_mut()),
+                &settings,
+            );
+        }
+        Err(err) => eprintln!("Could not read the settings for owned games: {err}"),
+    }
     snapshots
 }
 
@@ -919,6 +951,17 @@ struct SettingsUpdate {
     #[serde(rename = "steamgrid_db")]
     steamgrid_db: Option<SteamGridDbUpdate>,
     blacklisted_games: Option<Vec<u32>>,
+    owned_games: Option<OwnedGamesUpdate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OwnedGamesUpdate {
+    skip_games_in_steam: Option<bool>,
+    skip_installed_elsewhere: Option<bool>,
+    multi_store: Option<boilr_core::owned::MultiStore>,
+    store_order: Option<Vec<String>>,
+    name_label: Option<boilr_core::owned::NameLabel>,
+    confirm_above: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -937,6 +980,7 @@ struct SteamGridDbUpdate {
     allow_nsfw: Option<bool>,
     only_download_boilr_images: Option<bool>,
     auth_key: Option<Option<String>>,
+    match_by_store_id: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

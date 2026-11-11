@@ -12,6 +12,7 @@
 pub mod config;
 pub mod launch_and_wait;
 pub mod migration;
+pub mod owned;
 pub mod settings;
 pub mod steam;
 pub mod steamgriddb;

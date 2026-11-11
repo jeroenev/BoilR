@@ -28,7 +28,16 @@ const owned = (name: string): ShortcutSummary => ({
 
 let settings: Settings = {
   steam: { stop_steam: false, start_steam: false, create_collections: false, optimize_for_big_picture: false, location: null },
-  steamgrid_db: { enabled: true, prefer_animated: false, allow_nsfw: false, only_download_boilr_images: false, auth_key: "sample-key" },
+  steamgrid_db: { enabled: true, prefer_animated: false, allow_nsfw: false, only_download_boilr_images: false, auth_key: "sample-key", match_by_store_id: true },
+  owned_games: {
+    skip_games_in_steam: true,
+    skip_installed_elsewhere: true,
+    multi_store: "preferred",
+    store_order: ["gog", "epic", "amazon", "ea", "battlenet", "humble", "itch"],
+    name_label: "none",
+    // Low, so the confirmation before importing shows with the mock's few games.
+    confirm_above: 2,
+  },
   blacklisted_games: [],
 };
 
@@ -66,6 +75,7 @@ const account = (key: string, name: string, extra: Partial<StoreAccount> = {}): 
   code_name: `${key}_account`,
   enabled: false,
   install_with: "auto",
+  skip_prereleases: true,
   heroic_available: true,
   ...extra,
 });
@@ -242,6 +252,7 @@ mockIPC(
         return updateAccount(a.store, {
           ...(a.enabled === undefined ? {} : { enabled: a.enabled }),
           ...(a.installWith === undefined ? {} : { install_with: a.installWith }),
+          ...(a.skipPrereleases === undefined ? {} : { skip_prereleases: a.skipPrereleases }),
         });
       case "refresh_store_library":
         await delay(800);
@@ -287,6 +298,7 @@ mockIPC(
           ...a.update,
           steam: { ...settings.steam, ...a.update?.steam },
           steamgrid_db: { ...settings.steamgrid_db, ...a.update?.steamgrid_db },
+          owned_games: { ...settings.owned_games, ...a.update?.owned_games },
         };
         return settings;
       case "discover_games":

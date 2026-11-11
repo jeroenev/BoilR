@@ -78,11 +78,38 @@ neither: stores answer it for bot blocks too.
    the same identity as the store accounts. An installed EA game lists every offer id in
    its manifest. Playnite and Bottles games have no identity; Battle.net and Humble games
    have no installed-games platform, so they stay "Not installed".
-2. `accounts::drop_owned_duplicates` drops owned entries whose game is installed. They are
-   the same game when any of their ids match.
+2. `accounts::arrange_owned` decides which not-installed games go in, and their names
+   (see below). It always drops an owned entry whose game is installed through the same
+   store: they are the same game when any of their ids match.
 3. The sync writes the shortcuts. A game whose identity is already in `shortcuts.vdf`, by
    any of its ids, keeps that app id, even though its target changed.
 4. Owned games go into the Steam collection "Not installed" when collections are on.
+
+## Settings
+
+`[owned_games]` in `config.toml`, on the Accounts page of the Tauri app and in the egui
+settings:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `skip_games_in_steam` | `true` | Leaves out a game Steam has installed itself (same title). |
+| `skip_installed_elsewhere` | `true` | Leaves out a game installed from another store or launcher (same title). |
+| `multi_store` | `"preferred"` | A title several accounts own: `"preferred"` keeps the entry of the first store in `store_order`; `"label_store"` keeps one per store, named "Title (GOG)"; `"all"` keeps one per store, same name. |
+| `store_order` | GOG, Epic, Amazon, EA, Battle.net, Humble, itch | Store keys, most preferred first. Stores left out come after, in this default order. |
+| `name_label` | `"none"` | `"not_installed"`: "Title (Not installed)"; `"store"`: "Title (GOG)"; `"store_and_not_installed"`: "Title (GOG, not installed)". Steam has no not-installed state for shortcuts, so the name is the only place to say it. |
+| `confirm_above` | `100` | The Tauri app asks before an import that adds more not-installed games than this; `0` never asks. |
+
+Titles are compared by their letters and digits only ("PREY" and "Prey" match). A label
+does not change a game's app id, which comes from its identity, and is gone once the game
+is installed; artwork searches use the title without it.
+
+Per account (`[<store>_account]`): `skip_prereleases` (default `true`) leaves out betas,
+demos, playtests and test servers ("Barony (Beta)", "KillingFloor2Beta"), matched on whole
+words so "Demon's Tilt" stays.
+
+`[steamgrid_db] match_by_store_id` (default `true`) looks Epic, EA and Battle.net games up
+on SteamGridDB by their store id before searching by name. GOG and Amazon have no such
+lookup there and are searched by name.
 
 An owned shortcut's app id is a hash of its identity alone, not of exe and name. Owned
 shortcuts share their exe (`xdg-open`, a store launcher), and one title owned in two stores

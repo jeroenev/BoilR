@@ -160,8 +160,10 @@ impl MyEguiApp {
         let _ = sender.send(SyncProgress::Starting);
         if all_ready {
             let mut shortcuts_to_import = get_all_games(&self.games_to_sync);
-            crate::platforms::accounts::drop_owned_duplicates(
+            // Which games that are not installed go in, and their names: [owned_games].
+            crate::platforms::accounts::arrange_owned(
                 shortcuts_to_import.iter_mut().map(|(_, list)| list),
+                &settings,
             );
             let extra_collections: Vec<(String, Vec<u32>)> =
                 crate::platforms::accounts::not_installed_collection(

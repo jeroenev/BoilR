@@ -53,6 +53,7 @@ const applySettingsPatch = (current: Settings | null, patch: SettingsUpdatePaylo
     ...current,
     steam: { ...(current.steam ?? {}), ...(patch.steam ?? {}) },
     steamgrid_db: { ...(current.steamgrid_db ?? {}), ...(patch.steamgrid_db ?? {}) },
+    owned_games: { ...(current.owned_games ?? {}), ...(patch.owned_games ?? {}) },
     blacklisted_games: patch.blacklisted_games ? [...patch.blacklisted_games] : current.blacklisted_games,
   };
 };
@@ -209,6 +210,8 @@ const App = () => {
       try {
         setSettings(await invoke<Settings>("update_settings", { update: patch }));
         if (patch.blacklisted_games) setPlan(await invoke<SyncPlan>("plan_sync"));
+        // Which not-installed games go in, and their names, change with these.
+        if (patch.owned_games) await fetchAll();
       } catch (err) {
         setSettingsError(errorMessage(err));
         await fetchAll().catch(() => undefined);
@@ -408,6 +411,8 @@ const App = () => {
           </div>
         ) : view === "accounts" ? (
           <AccountsView
+            settings={settings}
+            onSettingsChange={updateSettings}
             onAccountsChanged={refreshAfterAccountChange}
             loginResult={loginResult}
             onLoginResultSeen={clearLoginResult}
@@ -450,6 +455,8 @@ const App = () => {
         restartsSteam={Boolean(settings?.steam?.start_steam)}
         hasGames={platforms.some((p) => p.enabled && p.games.length > 0)}
         padConnected={navStatus.pads.length > 0}
+        notInstalledToAdd={plan?.additions.filter((a) => !a.installed).length ?? 0}
+        confirmAbove={settings?.owned_games?.confirm_above ?? 100}
         onImport={runImport}
       />
     </div>

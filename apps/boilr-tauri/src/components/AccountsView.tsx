@@ -2,9 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import clsx from "clsx";
 
-import type { InstallWith, LoginResult, StoreAccount } from "../types";
+import type { InstallWith, LoginResult, SettingsUpdatePayload, StoreAccount } from "../types";
+import type { Settings } from "../settings";
 import { errorMessage } from "../lib/format";
 import { SettingRow, Toggle } from "./controls";
+import { OwnedGamesSettings } from "./OwnedGamesSettings";
 
 const INSTALL_WITH_LABELS: Record<InstallWith, string> = {
   auto: "The store's launcher, or its web page",
@@ -142,6 +144,19 @@ const AccountCard = ({
                 }
               />
             </SettingRow>
+            <SettingRow
+              title="Leave out betas, demos and test servers"
+              hint="Playtests, test servers and demos the account lists next to the games."
+            >
+              <Toggle
+                checked={account.skip_prereleases}
+                label={`Leave out betas and demos from ${account.name}`}
+                disabled={busy}
+                onChange={(skipPrereleases) =>
+                  run(() => invoke<StoreAccount>("update_store_account", { store: account.key, skipPrereleases }))
+                }
+              />
+            </SettingRow>
             <label className="block py-3">
               <span className="block font-bold text-foam">Games that are not installed open</span>
               <select
@@ -218,11 +233,15 @@ const AccountCard = ({
 };
 
 export const AccountsView = ({
+  settings,
+  onSettingsChange,
   onAccountsChanged,
   loginResult,
   onLoginResultSeen,
   librariesVersion,
 }: {
+  settings: Settings | null;
+  onSettingsChange: (patch: SettingsUpdatePayload) => Promise<void>;
   onAccountsChanged: () => void;
   /** Goes up when libraries were fetched again in the background: the accounts are read again. */
   librariesVersion: number;
@@ -293,6 +312,13 @@ export const AccountsView = ({
             {error}
           </p>
         ) : null}
+        <div className="mt-6">
+          <OwnedGamesSettings
+            settings={settings?.owned_games}
+            disabled={!settings}
+            onUpdate={(patch) => void onSettingsChange(patch)}
+          />
+        </div>
         <div className="mt-6">
           {loading ? <p className="text-mauve">Loading…</p> : null}
           {accounts.map((account) => (

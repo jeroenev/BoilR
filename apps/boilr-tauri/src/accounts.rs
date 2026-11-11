@@ -26,6 +26,8 @@ pub struct StoreAccount {
     code_name: String,
     enabled: bool,
     install_with: InstallWith,
+    /// Leave out betas, demos, playtests and test servers.
+    skip_prereleases: bool,
     /// Whether "Heroic first" is a choice here: Heroic installs games on Linux only.
     heroic_available: bool,
     /// Something the user should know about the action that returned this account, such as
@@ -57,11 +59,16 @@ fn account(store: StoreId) -> StoreAccount {
         .cloned()
         .and_then(|value| value.try_into::<InstallWith>().ok())
         .unwrap_or_default();
+    let skip_prereleases = platform_settings
+        .get("skip_prereleases")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     StoreAccount {
         status: stores::account_status(store),
         code_name: code_name.to_string(),
         enabled,
         install_with,
+        skip_prereleases,
         heroic_available: cfg!(not(windows)),
         notice: None,
     }
@@ -74,15 +81,27 @@ fn account_with_notice(store: StoreId, notice: Option<String>) -> StoreAccount {
     }
 }
 
-fn set_account_settings(
-    store: StoreId,
+/// A change to one account's settings; `None` leaves a setting as it is.
+#[derive(Default)]
+struct AccountChange {
     enabled: Option<bool>,
     install_with: Option<InstallWith>,
-) -> Result<(), String> {
+    skip_prereleases: Option<bool>,
+}
+
+fn set_account_settings(store: StoreId, change: AccountChange) -> Result<(), String> {
+    let AccountChange {
+        enabled,
+        install_with,
+        skip_prereleases,
+    } = change;
     let code_name = account_code_name(store);
     let mut table = load_platform_table(code_name)?;
     if let Some(enabled) = enabled {
         table.insert("enabled".to_string(), Value::Boolean(enabled));
+    }
+    if let Some(skip) = skip_prereleases {
+        table.insert("skip_prereleases".to_string(), Value::Boolean(skip));
     }
     if let Some(install_with) = install_with {
         let value = Value::try_from(install_with).map_err(|err| err.to_string())?;
@@ -103,9 +122,17 @@ pub fn update_store_account(
     store: String,
     enabled: Option<bool>,
     install_with: Option<InstallWith>,
+    skip_prereleases: Option<bool>,
 ) -> Result<StoreAccount, String> {
     let store = parse_store(&store)?;
-    set_account_settings(store, enabled, install_with)?;
+    set_account_settings(
+        store,
+        AccountChange {
+            enabled,
+            install_with,
+            skip_prereleases,
+        },
+    )?;
     Ok(account(store))
 }
 
@@ -125,7 +152,13 @@ pub async fn sign_out_store(store: String) -> Result<StoreAccount, String> {
         .await
         .map_err(|err| err.to_string())?;
     // A source without a sign-in would only report an error on every sync.
-    set_account_settings(store, Some(false), None)?;
+    set_account_settings(
+        store,
+        AccountChange {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )?;
     Ok(account_with_notice(store, warning))
 }
 

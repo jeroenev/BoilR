@@ -22,12 +22,53 @@ pub enum InstallWith {
     Browser,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountSettings {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub install_with: InstallWith,
+    /// Leave out betas, demos, playtests and test servers ([`is_prerelease`]).
+    #[serde(default = "default_true")]
+    pub skip_prereleases: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AccountSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            install_with: InstallWith::default(),
+            skip_prereleases: true,
+        }
+    }
+}
+
+/// Whether a title names a beta, a demo, a playtest or a test server rather than the game:
+/// "Barony (Beta)", "Shadwen demo", "Mortal Shell Tech Beta", "KillingFloor2Beta". Whole
+/// words only, so "Demon's Tilt" or "Alpha Protocol" stay.
+pub fn is_prerelease(title: &str) -> bool {
+    const WORDS: [&str; 4] = ["beta", "demo", "playtest", "pts"];
+    const PHRASES: [&str; 3] = ["test server", "tech test", "public test"];
+    let lower = title.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.iter().any(|w| WORDS.contains(w)) {
+        return true;
+    }
+    let spaced = words.join(" ");
+    if PHRASES.iter().any(|phrase| spaced.contains(phrase)) {
+        return true;
+    }
+    // A store id used as a title, its words run together ("KillingFloor2Beta").
+    title
+        .split_whitespace()
+        .any(|word| word.len() > 6 && (word.ends_with("Beta") || word.ends_with("Demo")))
 }
 
 #[derive(Clone)]
@@ -102,6 +143,7 @@ impl GamesPlatform for AccountPlatform {
         Ok(library
             .games
             .iter()
+            .filter(|game| !(self.settings.skip_prereleases && is_prerelease(&game.title)))
             .map(|game| ShortcutToImport {
                 shortcut: owned_shortcut(game, self.settings.install_with, &launchers),
                 needs_proton: false,
@@ -341,6 +383,10 @@ impl AccountPlatform {
                 }
             }
         }
+        ui.checkbox(
+            &mut self.settings.skip_prereleases,
+            "Leave out betas, demos, playtests and test servers",
+        );
         egui::ComboBox::from_label("Games that are not installed open")
             .selected_text(match self.settings.install_with {
                 InstallWith::Auto => "the store's launcher, or its web page",
@@ -389,5 +435,33 @@ mod tests {
         let platform =
             AccountPlatform::new(StoreId::Gog, "enabled = true\ninstall_with = \"browser\"\n");
         assert_eq!(platform.settings.install_with, InstallWith::Browser);
+        assert!(platform.settings.skip_prereleases, "on unless turned off");
+        let platform = AccountPlatform::new(StoreId::Gog, "skip_prereleases = false\n");
+        assert!(!platform.settings.skip_prereleases);
+    }
+
+    #[test]
+    fn betas_demos_and_test_servers_are_told_apart_from_games() {
+        for title in [
+            "Barony (Beta)",
+            "Shadwen demo",
+            "Mortal Shell Tech Beta",
+            "KillingFloor2Beta",
+            "Some Game Playtest",
+            "Game - Public Test Server",
+            "Game PTS",
+        ] {
+            assert!(is_prerelease(title), "{title}");
+        }
+        for title in [
+            "DEMON'S TILT",
+            "Hell is other demons",
+            "Alpha Protocol",
+            "Betrayal at Krondor",
+            "Demolish & Build",
+            "Frostpunk",
+        ] {
+            assert!(!is_prerelease(title), "{title}");
+        }
     }
 }

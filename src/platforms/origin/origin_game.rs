@@ -76,7 +76,7 @@ fn make_launch_url(id: &str, launcher_location: &std::path::Path) -> String {
 
 /// Every id in the `.mfst` id (URL-encoded, possibly several offers). The first is the
 /// game's own offer; the account may list the game under any of them, and the sync matches
-/// an owned entry on any (see `accounts::drop_owned_duplicates`).
+/// an owned entry on any (see `accounts::arrange_owned`).
 fn manifest_identity(id: &str) -> Option<String> {
     let ids = boilr_stores::ea::manifest_ids(id);
     (!ids.is_empty()).then(|| crate::sync::shortcut_identity("ea", &ids.join(",")))

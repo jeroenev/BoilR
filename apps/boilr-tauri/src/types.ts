@@ -97,7 +97,9 @@ export type SettingsUpdatePayload = {
     allow_nsfw?: boolean;
     only_download_boilr_images?: boolean;
     auth_key?: string | null;
+    match_by_store_id?: boolean;
   };
+  owned_games?: import("./settings").OwnedGamesSettings;
   blacklisted_games?: number[];
 };
 
@@ -197,6 +199,8 @@ export type StoreAccount = {
   code_name: string;
   enabled: boolean;
   install_with: InstallWith;
+  /** Leave out betas, demos, playtests and test servers. */
+  skip_prereleases: boolean;
   /** Whether "Heroic first" is a choice on this computer (Heroic installs games on Linux only). */
   heroic_available: boolean;
   /** About the action that returned this account: a sign-out the store could not be told
