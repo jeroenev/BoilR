@@ -53,6 +53,13 @@ Facts established by testing; Valve documents none of this.
   Steam started (in its tree). Otherwise the Steam chime plays and nothing appears, or Big
   Picture opens; there, "Resume game" does nothing when the tracked process has no window (for
   example a waiting helper).
+- **How the overlay gets in.** Steam loads `gameoverlayrenderer64.dll` / `gameoverlayrenderer.dll`
+  into what it starts, and it follows into child processes. It is loaded **even when the
+  shortcut's overlay is turned off** (Steam then only sets `SteamNoOverlayUI=1`). A game can
+  get the DLL without being logged as tracked (Far Cry 4, EA round 2 R4); in Far Cry 4 the
+  overlay still worked, in R4 it didn't. Loading the DLL into a game that already runs does
+  nothing (EA R11).
+- **Steam uses no job object** for what it starts (EA round 2 R1).
 - **Environment.** Steam sets `SteamAppId`, `SteamGameId`, `SteamClientLaunch`, `SteamEnv`,
   `SteamOverlayGameId` and others for what it starts. Passing those to the EA launcher by hand
   changed nothing (see the EA report).
@@ -83,9 +90,33 @@ Ways of testing that worked:
 - **Find a shortcut's app id:** read `appid` (little-endian u32 before `AppName`) from
   `shortcuts.vdf`, or the number in its artwork file names in `userdata\<user>\config\grid\`.
 
-Checks that turned out unreliable: `tasklist /m GameOverlayRenderer.dll` and
-`Process.Modules` did not show Steam's overlay in Far Cry 3 (32-bit), although the overlay
-worked there.
+- **Check the overlay without a controller:** send Shift+Tab to the game (`SendKeys`) and take
+  a screenshot (`System.Drawing` `CopyFromScreen`); works in windowed and most borderless
+  games, not reliably in exclusive fullscreen.
+- **Check a 32-bit game's modules from 32-bit PowerShell**
+  (`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`): from 64-bit PowerShell,
+  `Process.Modules` only shows the WOW64 modules, which is why round 1 missed Steam's overlay
+  in Far Cry 3.
+- **Job check:** [`tools/job-probe.ps1`](tools/job-probe.ps1), run by a Steam shortcut
+  (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File job-probe.ps1 -Tag <name>`), writes
+  `probe-<name>.txt` next to itself: whether it runs in a job, the job's limit flags and
+  members, whether Steam's overlay DLL is loaded, and whether `CREATE_BREAKAWAY_FROM_JOB` works.
+- **Ubisoft game configurations:** [`tools/ubisoft-vdat-decrypt.ps1`](tools/ubisoft-vdat-decrypt.ps1)
+  `-Out <file>` decrypts `configurations.vdat`; [`tools/ubisoft-configs.py`](tools/ubisoft-configs.py)
+  prints the `start_game` block of the given game ids.
+- **Resume / overlay window prototype:** [`tools/boilr-proto/`](tools/boilr-proto/) (standalone
+  cargo project; see its README).
+
+### Testing pitfall: Steam started from a terminal
+
+Programs started from an IDE's terminal (here: T3 Code, whose logon script puts its whole
+process tree in a Windows job object without `JOB_OBJECT_LIMIT_BREAKAWAY_OK`) inherit that
+job. Restarting Steam from such a terminal (`steam.exe -shutdown`, then `Start-Process
+steam.exe`) puts Steam and **everything it launches** in that job. The EA app then fails to
+start games (`Create Process: Access is denied`, because it uses `CREATE_BREAKAWAY_FROM_JOB`),
+which round 1 took for Steam's doing. Users never see this. To restart Steam (or start a
+launcher) from a terminal for tests, use `explorer.exe "C:\Program Files (x86)\Steam\steam.exe"`:
+Explorer starts it outside the job.
 
 ## What BoilR ships
 
@@ -123,7 +154,13 @@ Untested parts of the wait helper:
   games that start a second launcher, games running a program from outside their install
   folder, two games from the same launcher at once.
 
-Options not tried:
+Status after round 2: the EA app and Ubisoft Connect both give the real Steam overlay when
+Steam starts them (EA) or the game's exe (Ubisoft); see the reports. Options 1 and 2 below
+only matter where that isn't possible (EA app already running and not to be restarted). Both
+exist as a prototype not yet tried through Steam ([`tools/boilr-proto`](tools/boilr-proto/),
+`--mode resume|overlay`); option 3 was tried: dead end (EA R11).
+
+Options:
 
 1. **Resume forwarding.** "Resume game" does nothing because the tracked process (BoilR) has
    no window. If the helper owned a small window that, when Steam activates it, brings the

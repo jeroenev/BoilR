@@ -4,17 +4,26 @@ Tested on 2026-11-11 with **Alice: Madness Returns** (EA app 13.822.0.6335, Stea
 1792618285, Windows 11). See the [overview](README.md) for how Steam tracks shortcuts and
 where the logs are.
 
+> **Correction (round 2).** Round 1 below concluded that the EA app refuses to start games
+> from inside Steam's tree ("Access is denied"). That came from the test setup: Steam had been
+> restarted from an IDE terminal and inherited the IDE's Windows job object, which forbids
+> breakaway (see the [overview](README.md#testing-pitfall-steam-started-from-a-terminal)).
+> With Steam started normally, the EA app starts games from inside Steam's tree, Steam tracks
+> them and **the Steam overlay works** (round 2, R2 and R5). Rows affected by the job are
+> marked *(job)*.
+
 ## Result
 
 | | Status |
 |---|---|
-| Game starts from Steam, EA app open or closed | Works (BoilR wait helper, link through `explorer.exe`) |
-| Steam shows the game as running, returns to Play after it | Works (wait helper) |
-| Steam overlay in the game (Home button) | **No way found**: chime, no overlay |
-| Big Picture "Resume game" | **Doesn't work**: does nothing |
+| Game starts from Steam, EA app open or closed | Works (shipped: BoilR wait helper, link through `explorer.exe`) |
+| Steam shows the game as running, returns to Play after it | Works (shipped wait helper) |
+| Steam overlay in the game | **Works when Steam starts the EA app** (EA app closed beforehand: R2, R5); not with the shipped `explorer.exe` route, which keeps the EA app outside Steam's tree |
+| Big Picture "Resume game" | Not with the shipped route; untested with the EA app inside Steam's tree (needs a controller) |
 
-The overlay needs the game in Steam's process tree, and the EA app refuses to start games
-while it runs inside that tree (scenarios 9 and 10).
+The catch of the in-tree route: the EA app then stays in Steam's tree after the game, so Steam
+shows the game as running until the EA app is quit (as Ubisoft Connect, see that report). The
+helper's `--restart-launcher` (end the launcher before and after) handles that: round 3.
 
 ## The game and the EA app
 
@@ -23,8 +32,9 @@ while it runs inside that tree (scenarios 9 and 10).
 | Install folder | `D:\OriginLibrary\Alice Madness Returns\` (Windows uninstall entry `InstallLocation`, `{93A3AB24-36E8-41BA-80C6-CCEC237836DC}`) |
 | Installer data | `__Installer\installerdata.xml`, `<contentID>alice2_dd</contentID>` |
 | Game exe | `Game\Alice2\Binaries\Win32\AliceMadnessReturns.exe` (32-bit), from `<runtime><launcher><filePath>` with the registry prefix `[HKEY_LOCAL_MACHINE\SOFTWARE\Spicy Horse\Alice Madness Returns\Install Dir]` |
-| Launch link | `origin2://game/launch?offerIds=alice2_dd` (content id works as the offer id) |
+| Launch link | `origin2://game/launch?offerIds=alice2_dd` (content id works as the offer id); the EA app logs offer id `OFB-EAST:57154` |
 | Steam app id of BoilR's shortcut | 4055294683, game id 17417358039161241600 (kept across exe changes by the `owned-libraries` identity) |
+| EA app settings | `%LOCALAPPDATA%\Electronic Arts\EA Desktop\user_<id>.ini` (`user.igoenabled` = the EA in-game overlay) |
 
 Link handlers registered in `HKEY_CLASSES_ROOT\<scheme>\shell\open\command`:
 
@@ -39,13 +49,17 @@ What happens on `EALauncher.exe "origin2://..."` (from `EALauncher.log`,
 `EALaunchHelper.log`): EALauncher starts `EALaunchHelper.exe <link>` and exits within a second
 or two. EALaunchHelper hands the link to the running EA app, or, when it isn't running, starts
 `EADesktop.exe -updater_call -ls=LaunchHelper -gameSdkPort=3216 -silent
--launchHelperArgument=<link>` and exits. The game is started by `EADesktop.exe` (its parent),
-together with `OriginLegacyCompatibility.exe`.
+-launchHelperArgument=<link>` and exits. The game is started by `EADesktop.exe` (its parent,
+`createProcess ... breakaway=[true]` in `EADesktop.log`; the game gets a job of its own),
+together with `OriginLegacyCompatibility.exe`. The game gets **no arguments**, but about 25
+`EA*` environment variables (see R9).
 
-## Scenarios
+`EABackgroundService.exe` (a Windows service) lives in the same folder as `EADesktop.exe`.
+
+## Round 1 scenarios
 
 Each row: what was run, how, and what happened. "Direct" means started by hand from a shell,
-not by Steam.
+not by Steam. In round 1, Steam had been restarted from the IDE terminal (job).
 
 ### Which program opens the link
 
@@ -55,8 +69,8 @@ not by Steam.
 | 2 | `EALauncher.exe "origin2://..."` | Direct, EA app closed | **Game starts.** EA app starts too. |
 | 3 | `EALauncher.exe "origin2://..."` | Direct, EA app running | **Game starts.** |
 | 4 | `EALauncher.exe "origin2://..."` with Steam's variables (`SteamAppId=0`, `SteamGameId`, `SteamClientLaunch=1`, `SteamEnv=1`, `SteamOverlayGameId`, `SteamPath`) | Direct, EA app running | **Game starts.** The variables change nothing. |
-| 5 | `Link2EA.exe "link2ea://launchgame/alice2_dd?platform=origin"` | Direct | **Refused.** `Link2EA.log`: `"emsg":"invalid launch parameters (platform)"`; the user sees an EA dialog "Check that your game's installed correctly". Link2EA only takes games bought on Steam or Epic (`platform=steam`/`epic`). Not tried: other offer ids, other platforms. |
-| 6 | `AliceMadnessReturns.exe` (the game exe itself), working dir = its folder | Direct | **Game exits at once** and the EA app starts it again under a new process id (EA DRM). So Steam cannot start this game's exe itself and keep it. |
+| 5 | `Link2EA.exe "link2ea://launchgame/alice2_dd?platform=origin"` | Direct | **Refused.** `Link2EA.log`: `"emsg":"invalid launch parameters (platform)"`; the user sees an EA dialog "Check that your game's installed correctly". See R10 for `platform=steam`. |
+| 6 | `AliceMadnessReturns.exe` (the game exe itself), working dir = its folder | Direct | **Game exits at once** (exit code 100010) and the EA app starts it again under a new process id (EA DRM). Without the EA environment variables, Steam can't start this exe and keep it (see R9). |
 
 ### Through Steam (BoilR's shortcut or a test shortcut)
 
@@ -64,74 +78,52 @@ not by Steam.
 |---|---|---|---|
 | 7 | `EADesktop.exe` / *(empty)* / `"origin2://..."` | running | **Fails before starting:** `Failed running GameID ... (OS Error 123)`. Empty StartDir (see overview). Several attempts 17:00–17:13. |
 | 8 | `EALauncher.exe` / *(empty)* / `"origin2://..."` | running | **Same OS Error 123.** (The exe fix alone wasn't enough.) |
-| 9 | `EALauncher.exe` / `"...\EA Desktop\EA Desktop"` / `"origin2://..."` | running | **Game starts.** Steam tracks `EALauncher.exe` and `EALaunchHelper.exe` only; both exit within seconds; the game (parent `EADesktop.exe`) is not tracked. **Playing status ends at once**: Play shows again, pressing it starts a second launch. **Home:** chime, no overlay. **Resume:** nothing. |
-| 10 | Same as 9 | **closed** | **EA app error, game doesn't start.** Steam tracks `EALauncher` → `EALaunchHelper` → `EADesktop.exe` (+ `EACefSubProcess`, `EALocalHostSvc`, `IGOProxy32`). `EADesktop.log`: `[PROCESS] Create Process: Access is denied. \| exe=[...\AliceMadnessReturns.exe]` then `Game launch error: [9] (LaunchFailed)`. The EA app then stays inside Steam's tree (Steam shows the shortcut running) until it is closed. **So with BoilR's direct EALauncher shortcut, EA games only started from Steam while the EA app was already open.** |
+| 9 | `EALauncher.exe` / `"...\EA Desktop\EA Desktop"` / `"origin2://..."` | running | **Game starts.** Steam tracks `EALauncher.exe` and `EALaunchHelper.exe` only; both exit within seconds; the game (parent `EADesktop.exe`) is not tracked. **Playing status ends at once**: Play shows again, pressing it starts a second launch. **Home:** chime, no overlay. **Resume:** nothing. Reconfirmed without the job (R6). |
+| 10 | Same as 9 *(job)* | **closed** | **EA app error, game doesn't start.** Steam tracks `EALauncher` → `EALaunchHelper` → `EADesktop.exe` (+ `EACefSubProcess`, `EALocalHostSvc`, `IGOProxy32`). `EADesktop.log`: `[PROCESS] Create Process: Access is denied. \| exe=[...\AliceMadnessReturns.exe]` then `Game launch error: [9] (LaunchFailed)`. **Caused by the job; works without it (R2).** |
 | 11 | Test wrapper: `powershell.exe` / its folder / `-File launch-and-wait.ps1 -Link "origin2://..." -Folder "<game folder>"` (opens the link with `Start-Process`, waits while a process from the game folder runs) | running | **Game starts. Playing status correct:** Steam shows running (Stop button) for the whole game and returns to Play within seconds of quitting. **Home:** chime, no overlay. **Resume** is shown but does nothing (the tracked process has no window). |
-| 12 | `EADesktop.exe` (no arguments) started by a wrapper from Steam; then **Play pressed inside the EA app** | **closed** | **Same "Access is denied", launch error 9**, twice. This is the 2024 community workaround (add the EA app to Steam, start games from it); it no longer works. |
+| 12 | `EADesktop.exe` (no arguments) started by a wrapper from Steam; then **Play pressed inside the EA app** *(job)* | **closed** | **Same "Access is denied", launch error 9**, twice. Not yet repeated without the job by pressing Play (R4 used a link instead). |
 | 13 | BoilR `--launch-and-wait --launcher "C:\WINDOWS\explorer.exe" ...`, link passed **unquoted** (`Command::arg`) | closed | **Nothing happens**: explorer.exe ignores an unquoted `origin2://...?offerIds=...` link. Reproduced directly: `explorer.exe origin2://...` does nothing, `explorer.exe "origin2://..."` starts the EA app. |
-| 14 | BoilR `--launch-and-wait --launcher "C:\WINDOWS\explorer.exe" --link "origin2://..."`, link passed **quoted** (shipped) | closed | **Works.** Steam tracks only BoilR and `explorer.exe`; the EA app starts outside Steam's tree; game running after 6 s. Playing status correct; BoilR exits about 5–10 s after the game. No overlay. |
-| 15 | BoilR `--launch-and-wait --launcher "...\EALauncher.exe" ...` | closed | **Access is denied** (as 10): BoilR's child EALauncher starts the EA app inside Steam's tree. Hence explorer.exe (14). |
+| 14 | BoilR `--launch-and-wait --launcher "C:\WINDOWS\explorer.exe" --link "origin2://..."`, link passed **quoted** (shipped) | closed | **Works.** Steam tracks only BoilR and `explorer.exe`; the EA app starts outside Steam's tree; game running after 6 s. Playing status correct; BoilR exits about 5–10 s after the game. No overlay. With the EA app open: R7. |
+| 15 | BoilR `--launch-and-wait --launcher "...\EALauncher.exe" ...` *(job)* | closed | **Access is denied** (as 10). **Works without the job, with overlay (R5).** |
 
-## Why the EA app refuses to start games under Steam (unconfirmed)
+## Round 2 scenarios (Steam started normally)
 
-`Create Process: Access is denied` is what `CreateProcess` returns when a process inside a
-Windows job object asks for `CREATE_BREAKAWAY_FROM_JOB` and the job doesn't allow breakaway
-([Microsoft docs](https://learn.microsoft.com/windows/win32/procthread/process-creation-flags)).
-The guess: Steam puts what it launches in a job, and the EA app starts games with breakaway.
-Neither half is confirmed. Ways to check:
+Steam restarted through `explorer.exe` (outside any job). Every EA app instance started by a
+Steam shortcut or through `explorer.exe`. Overlay checked with Shift+Tab plus a screenshot;
+the controller's Home button and Resume are still for the user.
 
-- Process Explorer: `EADesktop.exe` started from Steam → Properties → Job tab (is there a job,
-  does it allow breakaway?).
-- Process Monitor: filter on `EADesktop.exe`, the failing `Process Create`, and its result.
+| # | What | EA app before | Result |
+|---|---|---|---|
+| R1 | Job probe: a PowerShell shortcut that queries its own job (`IsProcessInJob`, `QueryInformationJobObject`) and tries `CREATE_BREAKAWAY_FROM_JOB`, with Steam's overlay on and off | — | **Steam uses no job.** Probe in no job, breakaway works. (Under the IDE-started Steam: in the IDE's job, `LimitFlags = 0`, breakaway fails with error 5.) **`gameoverlayrenderer64.dll` is loaded even with the shortcut's overlay turned off**; Steam only adds `SteamNoOverlayUI=1`. |
+| R2 | TEST EA1: `EALauncher.exe "origin2://..."`, overlay on (= scenario 10) | closed | **Works, with overlay.** Game after 6 s, `createProcess ... breakaway=[true]` succeeds. `gameprocess_log`: `adding PID ... AliceMadnessReturns.exe` (parent EADesktop, tracked). `gameoverlayrenderer.dll` in the game, **Shift+Tab opened the Steam overlay**. After the game: **Steam keeps the shortcut running until the EA app is closed** (EADesktop and helpers are tracked). |
+| R3 | TEST EA2: same, overlay off | closed | Same: game starts and is tracked; no overlay (as set). |
+| R4 | EADesktop.exe (no arguments) as a Steam child, then the game asked for with `explorer.exe "origin2://..."` (instead of pressing Play) | closed | Game starts (parent the in-tree EADesktop), Steam's overlay DLL and FPS counter in it, but **Steam doesn't log the game as tracked** and Shift+Tab opens nothing. Pressing Play inside the EA app is untested (TEST EA6). |
+| R5 | BoilR `--launcher "...\EALauncher.exe"` (no `--restart-launcher`) as a Steam child (= scenario 15) | closed | **Works, with overlay.** Game after 5 s; Steam tracks BoilR → EALauncher → EALaunchHelper → EADesktop → game. Shift+Tab overlay. After the game, BoilR exits, but the shortcut stays running until the EA app is closed. |
+| R6 | TEST EA1 (= scenario 9) | open (via Explorer) | As scenario 9: game in 3 s, not tracked, Steam back to Play after 5 s, no overlay. |
+| R7 | Shipped shortcut (explorer.exe route) | open (via Explorer) | **Works.** Game after 3 s; Steam tracks BoilR and `explorer.exe` only; Steam back to Play ~2 s after the game. No overlay. |
+| R8 | EA app in-game overlay setting `user.igoenabled` 0 → 1, scenario 10 again *(job)* | closed | No difference (still the job's "Access is denied"). The EA overlay setting plays no role. |
+| R9 | What the EA app gives the game: command line and environment (read from the 32-bit PEB) | — | **No arguments.** Environment adds about 25 `EA*` variables: three login JWTs (valid 3 days), `EALaunchCode`, `EARtPLaunchCode`, `OriginSessionKey`, `ContentId`, `EALicenseToken` (offer id), `EALaunchOwner=EA`, `EALsxPort=3216`, and others. Starting the exe directly **with these variables** keeps it running as the same process (no DRM relaunch), with the EA app open or even closed; the same captured values worked 6+ times over 10 minutes. **Through Steam** (a PowerShell wrapper that sets them and starts the exe): tracked, **Steam overlay works**. Works by reusing EA login tokens, so it's a fallback at best; the in-tree EA app (R2/R5) gives the same without it. |
+| R10 | `Link2EA.exe "link2ea://launchgame/alice2_dd?platform=steam"`, and with the offer id `OFB-EAST:57154` | open | **Refused** both: the EA app looks for a Steam entitlement (`No active entitlement found`, `EntitlementNotFound`, `LaunchFailed`). Dead end. |
+| R11 | Load `GameOverlayRenderer.dll` into a running Alice (`CreateRemoteThread` + `LoadLibraryW`) | — | DLL loads, game keeps running, **no overlay** (no FPS counter, Shift+Tab nothing). Dead end. |
 
-If it is the job, a way around it would have to give the EA app a job that allows breakaway,
-or get the game created in Steam's tree some other way; neither is known to be possible.
+## Round 3: the helper with `--restart-launcher`
+
+Pending (see the results file of the session; to be filled in).
 
 ## Still open
 
-- Confirm or refute the job object theory (above).
-- Whether the EA app's own in-game overlay setting (EA app → Settings) changes anything for
-  Steam's overlay; one 2024 thread said it had to be on. Not tested.
-- `Link2EA.exe` with `platform=steam` or an EA offer id (`Origin.OFR.50.xxxx`) instead of the
-  content id. Not tested; Link2EA is meant for Steam/Epic purchases.
-- EA games whose exe Steam can start directly (no DRM relaunch): Steam would then track the
-  game and show the overlay. Only Alice was tried (scenario 6).
-- Games found through old Origin `.mfst` manifests still get `EADesktop.exe` +
-  `link2ea://launchgame/<id>` (or Origin's `origin2://`) and no wait helper; untested, likely
-  broken the same way (Link2EA handles `link2ea://`, not EADesktop).
-
-## Not yet tried (review of 2026-11-11)
-
-Gaps in what was tested:
-
-- Scenario 14 has a row for "EA app closed" only. "EA app already open" with the shipped
-  helper works (user-confirmed), but has no logged run.
+- Controller checks on the in-tree route (TEST EA1 / the round 3 shortcut, EA app closed):
+  Home button, Big Picture "Resume game", the shortcut's controller layout.
+- Pressing Play inside an EA app that Steam started (TEST EA6). R4 suggests the game is then
+  not tracked although the overlay DLL is in it.
+- What ending the EA app after the game does to cloud saves, and whether the EA app can be
+  asked to quit properly (round 3).
 - Only one EA game (Alice) was tried. Newer EA games (EA anticheat, Denuvo, their own
   launchers such as the Sims 4 or Battlefield ones) may hand over to other programs or run
   from outside the install folder.
-
-Options not tried, cheapest first:
-
-1. **Steam's overlay off for the shortcut, then scenario 10 again** (`AllowOverlay` = 0 in
-   `shortcuts.vdf`). "Access is denied" has a second possible cause besides the job object:
-   Steam loads its overlay into what it starts and hooks process creation so the overlay
-   follows into child programs (this is probably how it reached `farcry3.exe`, see the
-   Ubisoft report). The hook may clash with how the EA app creates games, or with the EA
-   app's own overlay injector (`IGOProxy32`, which was running in scenario 10). If the
-   launch works with the overlay off, the job is not the cause; then try the EA app's
-   in-game overlay off with Steam's on. Even overlay-off is a partial win: the EA app inside
-   Steam's tree would make Steam track the game itself (status and Resume without the
-   helper).
-2. **Check the job directly.** With a process that Steam started running, call
-   `IsProcessInJob` and `QueryInformationJobObject` (`JobObjectExtendedLimitInformation`)
-   from PowerShell: is there a job, does it set `JOB_OBJECT_LIMIT_BREAKAWAY_OK` or
-   `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`? If breakaway is allowed, BoilR could start the EA
-   app so that it can launch games; if not, nested jobs are the only idea left.
-3. **Copy what the EA app gives the game.** Scenario 6 started the bare exe. The EA app
-   starts it with its own command line and environment (some values likely login tokens
-   that expire). Read both from the running game (command line via `Win32_Process`,
-   environment from its PEB), then start the exe with them, first by hand, then from Steam.
-4. **Link2EA** with `platform=steam` or an `Origin.OFR.50.xxxx` offer id (low odds, see
-   above).
-5. Cross-launcher ideas (Resume forwarding, an overlay window of BoilR's own, injecting the
-   overlay into a running game) are in the [overview](README.md#not-yet-tried).
+- Games found through old Origin `.mfst` manifests still get `EADesktop.exe` +
+  `link2ea://launchgame/<id>` (or Origin's `origin2://`) and no wait helper; untested, likely
+  broken (Link2EA handles `link2ea://`, not EADesktop). None installed on the test machine.
+- Cross-launcher ideas (Resume forwarding, an overlay window of BoilR's own) are in the
+  [overview](README.md#not-yet-tried); with the in-tree route working, they only matter when
+  the EA app is already running and must not be restarted.
