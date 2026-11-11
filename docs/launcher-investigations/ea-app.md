@@ -99,3 +99,39 @@ or get the game created in Steam's tree some other way; neither is known to be p
 - Games found through old Origin `.mfst` manifests still get `EADesktop.exe` +
   `link2ea://launchgame/<id>` (or Origin's `origin2://`) and no wait helper; untested, likely
   broken the same way (Link2EA handles `link2ea://`, not EADesktop).
+
+## Not yet tried (review of 2026-11-11)
+
+Gaps in what was tested:
+
+- Scenario 14 has a row for "EA app closed" only. "EA app already open" with the shipped
+  helper works (user-confirmed), but has no logged run.
+- Only one EA game (Alice) was tried. Newer EA games (EA anticheat, Denuvo, their own
+  launchers such as the Sims 4 or Battlefield ones) may hand over to other programs or run
+  from outside the install folder.
+
+Options not tried, cheapest first:
+
+1. **Steam's overlay off for the shortcut, then scenario 10 again** (`AllowOverlay` = 0 in
+   `shortcuts.vdf`). "Access is denied" has a second possible cause besides the job object:
+   Steam loads its overlay into what it starts and hooks process creation so the overlay
+   follows into child programs (this is probably how it reached `farcry3.exe`, see the
+   Ubisoft report). The hook may clash with how the EA app creates games, or with the EA
+   app's own overlay injector (`IGOProxy32`, which was running in scenario 10). If the
+   launch works with the overlay off, the job is not the cause; then try the EA app's
+   in-game overlay off with Steam's on. Even overlay-off is a partial win: the EA app inside
+   Steam's tree would make Steam track the game itself (status and Resume without the
+   helper).
+2. **Check the job directly.** With a process that Steam started running, call
+   `IsProcessInJob` and `QueryInformationJobObject` (`JobObjectExtendedLimitInformation`)
+   from PowerShell: is there a job, does it set `JOB_OBJECT_LIMIT_BREAKAWAY_OK` or
+   `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`? If breakaway is allowed, BoilR could start the EA
+   app so that it can launch games; if not, nested jobs are the only idea left.
+3. **Copy what the EA app gives the game.** Scenario 6 started the bare exe. The EA app
+   starts it with its own command line and environment (some values likely login tokens
+   that expire). Read both from the running game (command line via `Win32_Process`,
+   environment from its PEB), then start the exe with them, first by hand, then from Steam.
+4. **Link2EA** with `platform=steam` or an `Origin.OFR.50.xxxx` offer id (low odds, see
+   above).
+5. Cross-launcher ideas (Resume forwarding, an overlay window of BoilR's own, injecting the
+   overlay into a running game) are in the [overview](README.md#not-yet-tried).

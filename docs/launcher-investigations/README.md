@@ -106,6 +106,39 @@ Branch `launch-and-wait` (on top of `ea-app-installed-games`):
   so Steam starts it (overlay, Resume) and returns to Play.
 - Linux/Proton shortcuts are unchanged.
 
+## Not yet tried
+
+From a review of these reports on 2026-11-11. Launcher-specific items are at the end of the
+[EA](ea-app.md#not-yet-tried-review-of-2026-11-11) and
+[Ubisoft](ubisoft-connect.md#not-yet-tried-review-of-2026-11-11) reports.
+
+Untested parts of the wait helper:
+
+- **Steam's Stop** while BoilR waits: Steam ends BoilR only; the game, outside the tree,
+  probably keeps running.
+- **Other Steam features**: Steam Input (the shortcut's controller layout), playtime, "In
+  game" for friends, F12 screenshots, game recording. The first three likely follow the
+  running status; screenshots and recording need the overlay.
+- **Harder cases**: the launcher asking for a login or an update first (10-minute limit),
+  games that start a second launcher, games running a program from outside their install
+  folder, two games from the same launcher at once.
+
+Options not tried:
+
+1. **Resume forwarding.** "Resume game" does nothing because the tracked process (BoilR) has
+   no window. If the helper owned a small window that, when Steam activates it, brings the
+   game's window to the front, Resume would work even without the overlay (Home would still
+   open Big Picture).
+2. **An overlay window of BoilR's own** (what GlosSI did). Steam already loads its overlay
+   into BoilR, because Steam starts it. A transparent, click-through, always-on-top window
+   that BoilR keeps presenting (Direct3D) would let the overlay draw over the game. GlosSI
+   being discontinued doesn't mean the technique stopped working. Limits: not over
+   exclusive-fullscreen games, and input focus has to move to the window while the overlay
+   is open.
+3. **Loading the overlay into a running game** (`GameOverlayRenderer.dll` /
+   `GameOverlayRenderer64.dll`). Only ruled out from research; never tried. Risky with
+   anti-cheat and DRM, so last, and only in single-player games without anti-cheat.
+
 ## Research (2026-11-11)
 
 Online search for a way to get Steam's overlay into launcher-started games:

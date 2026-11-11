@@ -63,3 +63,33 @@ in the folder.
   `service_log.txt`), to replace the fixed grace period.
 - Other Ubisoft games, especially ones with a separate launcher exe (the 5 s exit grace is
   meant to cover such hand-overs), and Ubisoft+ titles.
+
+## Not yet tried (review of 2026-11-11)
+
+Gaps in what ships:
+
+- **The default (`steam_overlay` off) was never run.** BoilR then still starts `upc.exe` as
+  its own child, only without closing Ubisoft Connect first. Expected: when Ubisoft Connect
+  was closed, Steam starts it inside its tree, and after the game Steam keeps showing the
+  game as running until Ubisoft Connect is closed (as scenario 3); when it was open, the new
+  `upc.exe` hands the link over and exits, and the status is right. A likely fix: with the
+  setting off, open the link through `explorer.exe`, as for EA (status always right, no
+  overlay).
+
+Options not tried, cheapest first:
+
+1. **Steam starts the game's exe directly.** Done for EA (DRM relaunch, EA scenario 6), never
+   for Ubisoft. Many Ubisoft games start Ubisoft Connect themselves for the login check and
+   keep running in the same process. If Far Cry 3 does, Steam tracks the game itself:
+   overlay, Resume and status without ending Ubisoft Connect. Open part: the exe path (the
+   registry only has the install folder; Ubisoft Connect's cached game configurations in
+   `...\Ubisoft Game Launcher\cache\configuration\` should have it).
+2. **Quitting Ubisoft Connect properly** instead of ending its processes: a setting that
+   makes closing the window quit instead of hiding to the tray, the log-off messages
+   (`WM_QUERYENDSESSION` / `WM_ENDSESSION`) to its windows, or its tray menu's Quit through UI
+   automation. A proper quit keeps its "game running" protection (scenario 4) and may finish
+   cloud saves.
+3. **A cloud-save signal from traffic:** wait until `upc.exe` stops sending data after the
+   game (per-process I/O counters), instead of a fixed 10 s. Needs a run where the game
+   saved.
+4. Cross-launcher ideas are in the [overview](README.md#not-yet-tried).
