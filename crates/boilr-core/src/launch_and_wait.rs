@@ -144,8 +144,9 @@ impl LaunchAndWait {
         if self.game_folder.parent().is_none() {
             eyre::bail!("{} is not a game folder", self.game_folder.display());
         }
+        let game_folder = Folder::new(&self.game_folder);
         let mut processes = Processes::new();
-        if processes.any_in(&self.game_folder) {
+        if processes.any_in(&game_folder) {
             log.line("the game is already running; waiting for it");
         } else {
             if self.restart_launcher {
@@ -164,7 +165,7 @@ impl LaunchAndWait {
             // Not waited for: EALauncher.exe exits at once, Ubisoft Connect keeps running.
             command.spawn()?;
             let started = Instant::now();
-            while !processes.any_in(&self.game_folder) {
+            while !processes.any_in(&game_folder) {
                 if started.elapsed() > START_TIMEOUT {
                     log.line("the game did not start; giving up");
                     return Ok(());
@@ -177,7 +178,7 @@ impl LaunchAndWait {
         let mut last_seen = Instant::now();
         while last_seen.elapsed() < EXIT_GRACE {
             sleep(POLL);
-            if processes.any_in(&self.game_folder) {
+            if processes.any_in(&game_folder) {
                 last_seen = Instant::now();
             }
         }
@@ -185,7 +186,7 @@ impl LaunchAndWait {
 
         if self.restart_launcher {
             sleep(CLOUD_SAVE_GRACE);
-            if processes.any_in(&self.game_folder) {
+            if processes.any_in(&game_folder) {
                 log.line("the game started again; leaving the launcher open");
             } else {
                 self.close_launcher(&mut processes, &mut log);
@@ -208,15 +209,16 @@ impl LaunchAndWait {
         if through_explorer {
             return;
         }
-        let ended = processes.kill_directly_in(folder);
+        let folder = Folder::new(folder);
+        let ended = processes.kill_directly_in(&folder);
         if ended == 0 {
             return;
         }
         log.line(&format!("closing the launcher ({ended} programs)"));
         let asked = Instant::now();
-        while processes.count_directly_in(folder) > 0 && asked.elapsed() < CLOSE_TIMEOUT {
+        while processes.count_directly_in(&folder) > 0 && asked.elapsed() < CLOSE_TIMEOUT {
             sleep(POLL);
-            processes.kill_directly_in(folder);
+            processes.kill_directly_in(&folder);
         }
     }
 }
@@ -238,19 +240,52 @@ fn comparable(path: &Path) -> String {
         .to_string()
 }
 
-/// Whether `exe` is in `folder` or a folder below it.
-fn is_in(exe: &Path, folder: &Path) -> bool {
-    let folder = comparable(folder);
-    comparable(exe)
-        .strip_prefix(&folder)
-        .is_some_and(|rest| rest.starts_with('\\'))
+/// `path` without the `\\?\` prefix that `std::fs::canonicalize` adds on Windows; programs'
+/// paths come without it.
+fn without_verbatim_prefix(path: String) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path
+    }
 }
 
-/// Whether `exe` is in `folder` itself.
-fn is_directly_in(exe: &Path, folder: &Path) -> bool {
-    comparable(exe)
-        .rsplit_once('\\')
-        .is_some_and(|(parent, _)| parent == comparable(folder))
+/// A folder to find programs in, as given and as it really is. Windows reports a program's
+/// path through the real folder when the given one is a link: the EA app's
+/// `EA Desktop\EA Desktop` links to a folder named after its version.
+struct Folder {
+    names: Vec<String>,
+}
+
+impl Folder {
+    fn new(path: &Path) -> Self {
+        let mut names = vec![comparable(path)];
+        if let Ok(real) = std::fs::canonicalize(path) {
+            let real = without_verbatim_prefix(comparable(&real));
+            if !names.contains(&real) {
+                names.push(real);
+            }
+        }
+        Folder { names }
+    }
+
+    /// Whether `exe` is in this folder or a folder below it.
+    fn holds(&self, exe: &Path) -> bool {
+        let exe = comparable(exe);
+        self.names.iter().any(|folder| {
+            exe.strip_prefix(folder.as_str())
+                .is_some_and(|rest| rest.starts_with('\\'))
+        })
+    }
+
+    /// Whether `exe` is in this folder itself.
+    fn holds_directly(&self, exe: &Path) -> bool {
+        comparable(exe)
+            .rsplit_once('\\')
+            .is_some_and(|(parent, _)| self.names.iter().any(|folder| folder == parent))
+    }
 }
 
 /// The programs running on this computer, by the path of their executable.
@@ -273,29 +308,29 @@ impl Processes {
         );
     }
 
-    fn any_in(&mut self, folder: &Path) -> bool {
+    fn any_in(&mut self, folder: &Folder) -> bool {
         self.refresh();
         self.system
             .processes()
             .values()
-            .any(|process| process.exe().is_some_and(|exe| is_in(exe, folder)))
+            .any(|process| process.exe().is_some_and(|exe| folder.holds(exe)))
     }
 
-    fn count_directly_in(&mut self, folder: &Path) -> usize {
+    fn count_directly_in(&mut self, folder: &Folder) -> usize {
         self.refresh();
         self.system
             .processes()
             .values()
-            .filter(|process| process.exe().is_some_and(|exe| is_directly_in(exe, folder)))
+            .filter(|process| process.exe().is_some_and(|exe| folder.holds_directly(exe)))
             .count()
     }
 
     /// Ends the programs in `folder` itself; returns how many there were.
-    fn kill_directly_in(&mut self, folder: &Path) -> usize {
+    fn kill_directly_in(&mut self, folder: &Folder) -> usize {
         self.refresh();
         let mut found = 0;
         for process in self.system.processes().values() {
-            if process.exe().is_some_and(|exe| is_directly_in(exe, folder)) {
+            if process.exe().is_some_and(|exe| folder.holds_directly(exe)) {
                 process.kill();
                 found += 1;
             }
@@ -416,28 +451,45 @@ mod tests {
 
     #[test]
     fn programs_belong_to_folders_by_path() {
-        let game = Path::new(r"D:\UplayLibrary\Far Cry 3\");
-        assert!(is_in(
-            Path::new(r"d:\uplaylibrary\far cry 3\bin\farcry3.exe"),
-            game
-        ));
-        assert!(!is_in(
-            Path::new(r"D:\UplayLibrary\Far Cry 3 Blood Dragon\bin\fc3.exe"),
-            game
-        ));
-        assert!(!is_in(Path::new(r"D:\UplayLibrary\Far Cry 3"), game));
+        let game = Folder::new(Path::new(r"D:\UplayLibrary\Far Cry 3\"));
+        assert!(game.holds(Path::new(r"d:\uplaylibrary\far cry 3\bin\farcry3.exe")));
+        assert!(!game.holds(Path::new(
+            r"D:\UplayLibrary\Far Cry 3 Blood Dragon\bin\fc3.exe"
+        )));
+        assert!(!game.holds(Path::new(r"D:\UplayLibrary\Far Cry 3")));
 
-        let launcher = Path::new(r"C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher");
-        assert!(is_directly_in(
-            Path::new(r"C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\upc.exe"),
-            launcher
+        let launcher = Folder::new(Path::new(
+            r"C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher",
         ));
+        assert!(launcher.holds_directly(Path::new(
+            r"C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\upc.exe"
+        )));
         // Games can be installed below the launcher's folder; those are not the launcher.
-        assert!(!is_directly_in(
-            Path::new(
-                r"C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\games\Far Cry 3\bin\farcry3.exe"
-            ),
-            launcher
-        ));
+        assert!(!launcher.holds_directly(Path::new(
+            r"C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\games\Far Cry 3\bin\farcry3.exe"
+        )));
+    }
+
+    #[test]
+    fn a_folder_also_matches_where_it_really_is() -> eyre::Result<()> {
+        // "." stands in for a link: the given name differs from the real path.
+        let real = std::env::current_dir()?;
+        let folder = Folder::new(Path::new("."));
+        assert!(folder.holds(&real.join("bin").join("game.exe")));
+        assert!(folder.holds_directly(&real.join("launcher.exe")));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_paths_lose_their_verbatim_prefix() {
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\c:\program files\ea".to_string()),
+            r"c:\program files\ea"
+        );
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\unc\server\share\ea".to_string()),
+            r"\\server\share\ea"
+        );
+        assert_eq!(without_verbatim_prefix(r"c:\ea".to_string()), r"c:\ea");
     }
 }
