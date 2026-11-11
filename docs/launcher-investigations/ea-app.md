@@ -23,7 +23,9 @@ where the logs are.
 
 The catch of the in-tree route: the EA app then stays in Steam's tree after the game, so Steam
 shows the game as running until the EA app is quit (as Ubisoft Connect, see that report). The
-helper's `--restart-launcher` (end the launcher before and after) handles that: round 3.
+helper's `--restart-launcher` (end the launcher before and after) handles that: rounds 3 and 4
+(R14, R15: tracking, overlay, Play again ~16 s after the game). BoilR doesn't write such EA
+shortcuts yet; it would be the EA equivalent of Ubisoft's `steam_overlay` setting.
 
 ## The game and the EA app
 
@@ -106,18 +108,34 @@ the controller's Home button and Resume are still for the user.
 | R10 | `Link2EA.exe "link2ea://launchgame/alice2_dd?platform=steam"`, and with the offer id `OFB-EAST:57154` | open | **Refused** both: the EA app looks for a Steam entitlement (`No active entitlement found`, `EntitlementNotFound`, `LaunchFailed`). Dead end. |
 | R11 | Load `GameOverlayRenderer.dll` into a running Alice (`CreateRemoteThread` + `LoadLibraryW`) | — | DLL loads, game keeps running, **no overlay** (no FPS counter, Shift+Tab nothing). Dead end. |
 
-## Round 3: the helper with `--restart-launcher`
+## Rounds 3 and 4: the helper with `--restart-launcher`
 
-Pending (see the results file of the session; to be filled in).
+Shortcut TEST EA7: BoilR `--launch-and-wait --game-folder "D:\OriginLibrary\Alice Madness
+Returns" --launcher "...\EA Desktop\EALauncher.exe" --link "origin2://..." --restart-launcher`.
+Steam started normally.
+
+| # | What | EA app before | Result |
+|---|---|---|---|
+| R12 | TEST EA7, BoilR before commit cddaa47 | closed | Game after 5 s, tracked, Shift+Tab overlay. **But BoilR ended nothing after the game**: `EA Desktop\EA Desktop` is a **symbolic link** to `...\EA Desktop\13.822.0.6335-1793732195\EA Desktop`, Windows reports the programs' paths through the real folder, and BoilR compared against the link. Steam kept showing the game running until the EA app was closed by hand. Fixed in cddaa47 (folders also match through their real path). |
+| R13 | Same | open | Because of the same bug, the open EA app was reused: scenario 9 (not tracked, no overlay). Ending the EA app by hand before the launch and 15 s after the game gave the expected result, and EALauncher restarted it **signed in, no prompt**. |
+| R14 | TEST EA7, fixed BoilR, game quit from its own menu | closed | **Works.** Game after 5 s, tracked, Shift+Tab overlay (the first try during the intro video showed only the FPS counter). `Post game cloud sync completed successfully` ~1 s after the game; `closing the launcher (7 programs)` (EADesktop, EALocalHostSvc, 5 EACefSubProcess) 14 s after that; Steam back to Play **16 s** after the game. `EABackgroundService` untouched (BoilR can't read a service's path, so it never matches). |
+| R15 | Same | open (via Explorer, signed in) | **Works.** `closing the launcher (7 programs)` before the launch, EALauncher restarts it signed in inside Steam's tree, game after 5 s, tracked, Shift+Tab overlay. Back to Play **17 s** after the game, again after the cloud sync line. |
+| R16 | Cloud saves | — | Alice syncs (cloud id `50391_`). The EA app logs `Post game cloud sync completed successfully` (`game.cloud.succ`) 0.8–1.5 s after the game exits, well before BoilR's 5 s + 10 s. Nothing had changed between runs, so a real upload's duration is untested. A real "finished" signal exists here, unlike Ubisoft Connect. |
+| R17 | Quitting the EA app properly | running, no game | No quit switch in the exe files, no close-to-tray setting in the ini. **`WM_CLOSE` to the main window and the tray menu's Exit both quit it cleanly in ~1 s**, also when Steam started it silently. `WM_CLOSE` during the post-game sync opens a "Saving your progress to the cloud... EC:10609" dialog that keeps the app open until someone clicks "Skip sync & close", so only ask after the sync line. |
+
+So for EA, `--restart-launcher` with `EALauncher.exe` gives what Ubisoft's `steam_overlay`
+gives: tracking, the Steam overlay, and Play again ~16 s after the game. Same risks as for
+Ubisoft (a download in the EA app is cut off; a second EA game loses its launcher). Better
+than Ubisoft: the cloud-sync line could replace the fixed grace, and `WM_CLOSE` could replace
+ending the processes.
 
 ## Still open
 
-- Controller checks on the in-tree route (TEST EA1 / the round 3 shortcut, EA app closed):
-  Home button, Big Picture "Resume game", the shortcut's controller layout.
+- Controller checks on the in-tree route (TEST EA7): Home button, Big Picture "Resume game",
+  the shortcut's controller layout.
 - Pressing Play inside an EA app that Steam started (TEST EA6). R4 suggests the game is then
   not tracked although the overlay DLL is in it.
-- What ending the EA app after the game does to cloud saves, and whether the EA app can be
-  asked to quit properly (round 3).
+- How long a real cloud upload takes (play, let the game save, quit; R16).
 - Only one EA game (Alice) was tried. Newer EA games (EA anticheat, Denuvo, their own
   launchers such as the Sims 4 or Battlefield ones) may hand over to other programs or run
   from outside the install folder.
