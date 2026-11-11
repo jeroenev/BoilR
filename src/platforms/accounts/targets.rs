@@ -284,9 +284,10 @@ fn browser(launchers: &Launchers, url: &str) -> Target {
 
 fn open_link(launchers: &Launchers, link: &str) -> Target {
     match &launchers.opener {
+        // Steam on Windows fails to start a shortcut with an empty StartDir (OS error 123).
         Opener::Explorer(explorer) => Target {
             exe: quoted(explorer),
-            start_dir: String::new(),
+            start_dir: parent_dir(explorer),
             launch_options: format!("\"{link}\""),
         },
         Opener::XdgOpen => Target {
@@ -672,10 +673,11 @@ mod tests {
         assert!(target(&gog, InstallWith::Auto, &launchers)
             .launch_options
             .contains("goggalaxy://openGameView/1"));
-        assert_eq!(
-            target(&gog, InstallWith::Browser, &launchers).launch_options,
-            "\"https://www.gog.com/account\""
-        );
+        let in_browser = target(&gog, InstallWith::Browser, &launchers);
+        assert_eq!(in_browser.launch_options, "\"https://www.gog.com/account\"");
+        // Only Windows reads `C:\` paths as folders.
+        #[cfg(windows)]
+        assert_eq!(in_browser.start_dir, "\"C:\\Windows\"");
     }
 
     #[test]
