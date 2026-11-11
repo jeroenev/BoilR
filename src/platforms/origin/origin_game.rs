@@ -58,6 +58,16 @@ fn make_launch_url(id: &str, launcher_location: &std::path::Path) -> String {
     }
 }
 
+/// `explorer.exe`, which hands a link to the Explorer that is already running. The EA app
+/// that starts the game, when it is not running yet, then starts outside Steam's process
+/// tree: inside it, the EA app cannot start games ("Create Process: Access is denied" in
+/// its log, launch error 9). Opening the link with `EALauncher.exe` directly from Steam
+/// fails that way whenever the EA app is closed.
+fn shell_opener() -> PathBuf {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    PathBuf::from(root).join("explorer.exe")
+}
+
 impl From<EAGame> for ShortcutOwned {
     fn from(game: EAGame) -> Self {
         let url = launch_url(&game);
@@ -68,7 +78,7 @@ impl From<EAGame> for ShortcutOwned {
         ) {
             (Some(helper), Some(game_folder), None) => {
                 let target = LaunchAndWait {
-                    launcher: game.launcher_location.clone(),
+                    launcher: shell_opener(),
                     link: url,
                     game_folder: game_folder.clone(),
                     restart_launcher: false,
@@ -158,9 +168,12 @@ mod tests {
         };
         let shortcut: ShortcutOwned = game.into();
         assert_eq!(shortcut.exe, r#""C:\BoilR\BoilR.exe""#);
-        assert_eq!(
-            shortcut.launch_options,
-            r#"--launch-and-wait --game-folder "D:\Games\Alice Madness Returns" --launcher "C:\EA Desktop\EALauncher.exe" --link "origin2://game/launch?offerIds=alice2_dd""#
-        );
+        assert!(shortcut.launch_options.starts_with(
+            r#"--launch-and-wait --game-folder "D:\Games\Alice Madness Returns" --launcher ""#
+        ));
+        // The link goes through Explorer, so a closed EA app starts outside Steam.
+        assert!(shortcut
+            .launch_options
+            .ends_with(r#"explorer.exe" --link "origin2://game/launch?offerIds=alice2_dd""#));
     }
 }

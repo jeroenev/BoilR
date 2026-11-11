@@ -152,6 +152,11 @@ impl LaunchAndWait {
                 self.close_launcher(&mut processes, &mut log);
             }
             let mut command = Command::new(&self.launcher);
+            // Quoted, as Steam passes it: `arg` only quotes values with spaces, and
+            // explorer.exe ignores an unquoted `origin2://...?offerIds=...` link.
+            #[cfg(windows)]
+            std::os::windows::process::CommandExt::raw_arg(&mut command, quoted(&self.link));
+            #[cfg(not(windows))]
             command.arg(&self.link);
             if let Some(folder) = self.launcher.parent() {
                 command.current_dir(folder);
@@ -195,6 +200,14 @@ impl LaunchAndWait {
         let Some(folder) = self.launcher.parent() else {
             return;
         };
+        // A link opened through Explorer: its folder is Windows' own.
+        let through_explorer = self
+            .launcher
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"));
+        if through_explorer {
+            return;
+        }
         let ended = processes.kill_directly_in(folder);
         if ended == 0 {
             return;
