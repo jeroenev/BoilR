@@ -37,10 +37,10 @@ const RESTART_LAUNCHER: &str = "--restart-launcher";
 const START_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long no program from the game's folder may run before the game counts as closed.
 /// Some games restart themselves or hand over from a small launcher to the game.
-const EXIT_GRACE: Duration = Duration::from_secs(10);
+const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// How long a restarted launcher gets after the game, to upload cloud saves, before it is
 /// closed.
-const CLOUD_SAVE_GRACE: Duration = Duration::from_secs(20);
+const CLOUD_SAVE_GRACE: Duration = Duration::from_secs(10);
 /// How long a launcher that is being closed gets to go away.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_secs(1);
