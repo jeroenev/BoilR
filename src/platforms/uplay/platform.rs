@@ -33,14 +33,15 @@ impl NeedsProton<UbisoftPlatform> for UbisoftGame {
     }
 }
 
-fn get_ubisoft_games() -> eyre::Result<Vec<UbisoftGame>> {
+fn get_ubisoft_games(settings: &UbisoftSettings) -> eyre::Result<Vec<UbisoftGame>> {
     #[cfg(target_family = "unix")]
     {
+        let _ = settings;
         get_games_from_proton()
     }
     #[cfg(target_os = "windows")]
     {
-        get_games_from_winreg()
+        get_games_from_winreg(settings)
     }
 }
 
@@ -120,7 +121,7 @@ fn get_launcher_path() -> eyre::Result<UbisoftPathData> {
 }
 
 #[cfg(target_os = "windows")]
-fn get_games_from_winreg() -> eyre::Result<Vec<UbisoftGame>> {
+fn get_games_from_winreg(settings: &UbisoftSettings) -> eyre::Result<Vec<UbisoftGame>> {
     use winreg::enums::*;
     use winreg::RegKey;
 
@@ -136,14 +137,15 @@ fn get_games_from_winreg() -> eyre::Result<Vec<UbisoftGame>> {
                 if let Ok(folder) = install_dir {
                     let path = Path::new(&folder);
                     if path.exists() {
-                        installed_ids.push(i);
+                        installed_ids.push((i, path.to_path_buf()));
                     }
                 }
             }
         }
     }
 
-    for id in installed_ids {
+    let helper = boilr_core::launch_and_wait::helper();
+    for (id, game_folder) in installed_ids {
         let path = format!("SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Uplay Install {}",id);
         let subkey = hklm.open_subkey(path);
         if let Ok(subkey) = subkey {
@@ -157,6 +159,9 @@ fn get_games_from_winreg() -> eyre::Result<Vec<UbisoftGame>> {
                     launcher: launcher_path.clone(),
                     launcher_compat_folder: None,
                     launch_id: 0,
+                    game_folder: Some(game_folder),
+                    helper: helper.clone(),
+                    restart_launcher: settings.steam_overlay,
                 })
             }
         }
@@ -198,6 +203,9 @@ fn get_games_from_proton() -> eyre::Result<Vec<UbisoftGame>> {
         launcher: launcher_path.exe_path.clone(),
         launcher_compat_folder: launcher_path.compat_folder.clone(),
         launch_id: game.launch_id,
+        game_folder: None,
+        helper: None,
+        restart_launcher: false,
     });
     Ok(games.collect())
 }
@@ -295,13 +303,18 @@ impl GamesPlatform for UbisoftPlatform {
     }
 
     fn get_shortcut_info(&self) -> eyre::Result<Vec<ShortcutToImport>> {
-        to_shortcuts_simple(get_ubisoft_games())
+        to_shortcuts_simple(get_ubisoft_games(&self.settings))
     }
 
     #[cfg(feature = "egui-ui")]
     fn render_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Ubisoft Connect");
         ui.checkbox(&mut self.settings.enabled, "Import from Ubisoft Connect");
+        #[cfg(windows)]
+        ui.checkbox(
+            &mut self.settings.steam_overlay,
+            "Steam overlay: close Ubisoft Connect before and after each game, so Steam starts it",
+        );
     }
 
     fn get_settings_serializable(&self) -> String {

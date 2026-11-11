@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use boilr_core::launch_and_wait::LaunchAndWait;
 use steam_shortcuts_util::{shortcut::ShortcutOwned, Shortcut};
 
 #[derive(Clone)]
@@ -11,6 +12,12 @@ pub struct EAGame {
     pub launcher_location: PathBuf,
     pub launcher_compat_folder: Option<PathBuf>,
     pub found_by: FoundBy,
+    /// The game's install folder, when known (games found by their installer data).
+    pub game_folder: Option<PathBuf>,
+    /// The BoilR the shortcut runs to wait for the game, see
+    /// [`boilr_core::launch_and_wait`]: the launcher exits as soon as it has handed the game
+    /// to the EA app, so Steam would otherwise count the game as stopped while it runs.
+    pub helper: Option<PathBuf>,
 }
 
 /// Where BoilR found an installed EA game, which decides what its id is and how it starts.
@@ -54,26 +61,49 @@ fn make_launch_url(id: &str, launcher_location: &std::path::Path) -> String {
 impl From<EAGame> for ShortcutOwned {
     fn from(game: EAGame) -> Self {
         let url = launch_url(&game);
-        let launch = match game.launcher_compat_folder {
-            Some(compat_folder) => format!(
-                "STEAM_COMPAT_DATA_PATH=\"{}\" %command% \"{url}\"",
-                compat_folder.to_string_lossy()
-            ),
-            None => format!("\"{url}\""),
+        let (exe, start_dir, launch) = match (
+            &game.helper,
+            &game.game_folder,
+            &game.launcher_compat_folder,
+        ) {
+            (Some(helper), Some(game_folder), None) => {
+                let target = LaunchAndWait {
+                    launcher: game.launcher_location.clone(),
+                    link: url,
+                    game_folder: game_folder.clone(),
+                    restart_launcher: false,
+                }
+                .shortcut_target(helper);
+                (target.exe, target.start_dir, target.launch_options)
+            }
+            _ => {
+                let launch = match &game.launcher_compat_folder {
+                    Some(compat_folder) => format!(
+                        "STEAM_COMPAT_DATA_PATH=\"{}\" %command% \"{url}\"",
+                        compat_folder.to_string_lossy()
+                    ),
+                    None => format!("\"{url}\""),
+                };
+                // Steam on Windows starts a shortcut in its StartDir and fails with OS error
+                // 123 ("Failed running GameID ..." in logs/gameprocess_log.txt) when it is
+                // empty.
+                let start_dir = game
+                    .launcher_location
+                    .parent()
+                    .filter(|folder| !folder.as_os_str().is_empty())
+                    .map(|folder| format!("\"{}\"", folder.to_string_lossy()))
+                    .unwrap_or_default();
+                (
+                    format!("\"{}\"", game.launcher_location.to_string_lossy()),
+                    start_dir,
+                    launch,
+                )
+            }
         };
-        let launcher_location = format!("\"{}\"", game.launcher_location.to_string_lossy());
-        // Steam on Windows starts a shortcut in its StartDir and fails with OS error 123
-        // ("Failed running GameID ..." in logs/gameprocess_log.txt) when it is empty.
-        let start_dir = game
-            .launcher_location
-            .parent()
-            .filter(|folder| !folder.as_os_str().is_empty())
-            .map(|folder| format!("\"{}\"", folder.to_string_lossy()))
-            .unwrap_or_default();
         let mut owned_shortcut = Shortcut::new(
             "0",
             game.title.as_str(),
-            &launcher_location,
+            &exe,
             &start_dir,
             "",
             "",
@@ -100,6 +130,8 @@ mod tests {
             launcher_location: PathBuf::from(r"C:\EA Desktop\EALauncher.exe"),
             launcher_compat_folder: None,
             found_by: FoundBy::InstallerData,
+            game_folder: None,
+            helper: None,
         };
         let shortcut: ShortcutOwned = game.into();
         assert_eq!(shortcut.exe, "\"C:\\EA Desktop\\EALauncher.exe\"");
@@ -111,5 +143,24 @@ mod tests {
             "\"origin2://game/launch?offerIds=alice2_dd,1002139\""
         );
         assert!(shortcut.tags.contains(&"Installed".to_string()));
+    }
+
+    #[test]
+    fn a_game_with_a_known_folder_runs_boilr_to_wait_for_it() {
+        let game = EAGame {
+            id: "alice2_dd".to_string(),
+            title: "Alice: Madness Returns".to_string(),
+            launcher_location: PathBuf::from(r"C:\EA Desktop\EALauncher.exe"),
+            launcher_compat_folder: None,
+            found_by: FoundBy::InstallerData,
+            game_folder: Some(PathBuf::from(r"D:\Games\Alice Madness Returns\")),
+            helper: Some(PathBuf::from(r"C:\BoilR\BoilR.exe")),
+        };
+        let shortcut: ShortcutOwned = game.into();
+        assert_eq!(shortcut.exe, r#""C:\BoilR\BoilR.exe""#);
+        assert_eq!(
+            shortcut.launch_options,
+            r#"--launch-and-wait --game-folder "D:\Games\Alice Madness Returns" --launcher "C:\EA Desktop\EALauncher.exe" --link "origin2://game/launch?offerIds=alice2_dd""#
+        );
     }
 }

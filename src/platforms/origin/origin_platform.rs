@@ -63,6 +63,8 @@ impl EAPlatform {
                     launcher_location: link_handler.clone(),
                     launcher_compat_folder: None,
                     found_by: FoundBy::InstallerData,
+                    game_folder: Some(found.folder),
+                    helper: boilr_core::launch_and_wait::helper(),
                 });
             }
         }
@@ -91,6 +93,8 @@ fn manifest_games(content_folder: &Path, ea_folders: &EAPathData) -> eyre::Resul
                 launcher_location: launcher_exe.clone(),
                 launcher_compat_folder: ea_folders.compat_folder.clone(),
                 found_by: FoundBy::Manifest,
+                game_folder: None,
+                helper: None,
             })
         });
     Ok(games.collect())
