@@ -229,6 +229,17 @@ fn windows_path(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path.replace('/', "\\"))
 }
 
+/// `base` and `more` joined with a Windows separator, on every system (`PathBuf::join`
+/// would use `/` on Linux, where the tests run too).
+fn windows_join(base: &std::path::Path, more: &str) -> std::path::PathBuf {
+    let base = base.to_string_lossy();
+    windows_path(&format!(
+        "{}\\{}",
+        base.trim_end_matches(['\\', '/']),
+        more.trim_start_matches(['\\', '/'])
+    ))
+}
+
 impl Executable {
     /// Where the program is and the folder it starts in, given a way to read registry
     /// entries. `None` for programs that need arguments: the shortcut can't pass them.
@@ -247,11 +258,11 @@ impl Executable {
         let (register, append) = self.working_directory.as_ref()?;
         let mut working_directory = windows_path(&read(register)?);
         if let Some(append) = append {
-            working_directory.push(windows_path(append));
+            working_directory = windows_join(&working_directory, append);
         }
         let exe = match &self.path {
-            Source::Relative(path) => working_directory.join(windows_path(path)),
-            Source::Register(register) => working_directory.join(windows_path(&read(register)?)),
+            Source::Relative(path) => windows_join(&working_directory, path),
+            Source::Register(register) => windows_join(&working_directory, &read(register)?),
         };
         Some(GameProgram {
             exe,

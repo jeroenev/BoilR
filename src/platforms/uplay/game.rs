@@ -35,11 +35,14 @@ pub(crate) struct UbisoftGame {
 const UBISOFT_CONNECT_READY: &str = "AccountStartupUser.cpp";
 
 /// Ubisoft Connect's log: `logs\launcher_log.txt` in its install folder.
+/// Built as text: it's a Windows path, and `Path::parent` doesn't split those on Linux, where
+/// the tests run too.
 fn launcher_log(upc: &Path) -> PathBuf {
-    upc.parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join("logs")
-        .join("launcher_log.txt")
+    let upc = upc.to_string_lossy();
+    let folder = upc
+        .rsplit_once(['\\', '/'])
+        .map_or("", |(folder, _)| folder);
+    PathBuf::from(format!(r"{folder}\logs\launcher_log.txt"))
 }
 
 /// The title of Ubisoft Connect's window: a close request to it quits Ubisoft Connect while

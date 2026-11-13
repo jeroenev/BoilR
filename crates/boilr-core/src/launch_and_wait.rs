@@ -282,9 +282,11 @@ impl LaunchAndWait {
     /// started (no link), or when Explorer opens the link (its folder is Windows' own).
     fn launcher_folder(&self) -> Option<Folder> {
         self.link.as_ref()?;
-        let through_explorer = self
-            .launcher
-            .file_name()
+        // By text: a Windows path has no file name on Linux, where the tests run too.
+        let launcher = self.launcher.to_string_lossy();
+        let through_explorer = launcher
+            .rsplit(['\\', '/'])
+            .next()
             .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"));
         if through_explorer {
             return None;
