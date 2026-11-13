@@ -145,6 +145,11 @@ fn get_games_from_winreg(settings: &UbisoftSettings) -> eyre::Result<Vec<Ubisoft
     }
 
     let helper = boilr_core::launch_and_wait::helper();
+    let programs = if settings.start_game_exe && helper.is_some() {
+        super::catalogue::game_programs()
+    } else {
+        Default::default()
+    };
     for (id, game_folder) in installed_ids {
         let path = format!("SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Uplay Install {}",id);
         let subkey = hklm.open_subkey(path);
@@ -152,6 +157,7 @@ fn get_games_from_winreg(settings: &UbisoftSettings) -> eyre::Result<Vec<Ubisoft
             let name: Result<String, _> = subkey.get_value("DisplayName");
             if let Ok(name) = name {
                 let icon: String = subkey.get_value("DisplayIcon").unwrap_or_default();
+                let program = programs.get(&id).cloned();
                 games.push(UbisoftGame {
                     name,
                     icon,
@@ -162,6 +168,7 @@ fn get_games_from_winreg(settings: &UbisoftSettings) -> eyre::Result<Vec<Ubisoft
                     game_folder: Some(game_folder),
                     helper: helper.clone(),
                     restart_launcher: settings.steam_overlay,
+                    program,
                 })
             }
         }
@@ -206,6 +213,7 @@ fn get_games_from_proton() -> eyre::Result<Vec<UbisoftGame>> {
         game_folder: None,
         helper: None,
         restart_launcher: false,
+        program: None,
     });
     Ok(games.collect())
 }
@@ -314,6 +322,11 @@ impl GamesPlatform for UbisoftPlatform {
         ui.checkbox(
             &mut self.settings.steam_overlay,
             "Steam overlay also when Ubisoft Connect is open: close it before each game",
+        );
+        #[cfg(windows)]
+        ui.checkbox(
+            &mut self.settings.start_game_exe,
+            "Start the game's own program (experimental): overlay without closing Ubisoft Connect",
         );
     }
 

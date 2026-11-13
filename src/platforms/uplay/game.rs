@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use boilr_core::launch_and_wait::LaunchAndWait;
+use boilr_core::launch_and_wait::{LaunchAndWait, OpenFirst};
 use steam_shortcuts_util::shortcut::{Shortcut, ShortcutOwned};
 
 #[derive(Clone)]
@@ -21,7 +21,13 @@ pub(crate) struct UbisoftGame {
     /// Close an open Ubisoft Connect before the game too, so Steam starts it and its overlay
     /// reaches the game ([`super::settings::UbisoftSettings::steam_overlay`]).
     pub(crate) restart_launcher: bool,
+    /// The game's own program, for Steam to start instead of the link
+    /// ([`super::settings::UbisoftSettings::start_game_exe`]).
+    pub(crate) program: Option<super::catalogue::GameProgram>,
 }
+
+/// The title of Ubisoft Connect's window, which shows it is up.
+const UBISOFT_CONNECT_WINDOW: &str = "Ubisoft Connect";
 
 impl From<UbisoftGame> for ShortcutOwned {
     fn from(game: UbisoftGame) -> Self {
@@ -31,16 +37,30 @@ impl From<UbisoftGame> for ShortcutOwned {
             &game.game_folder,
             &game.launcher_compat_folder,
         ) {
-            // Ubisoft Connect can't be asked to quit (a close request only hides it), so a
-            // Ubisoft Connect this launch started is ended after the game.
-            let target = LaunchAndWait {
-                launcher: game.launcher.clone(),
-                link: Some(link),
-                game_folder: game_folder.clone(),
-                restart_launcher: game.restart_launcher,
-                ..LaunchAndWait::default()
-            }
-            .shortcut_target(helper);
+            let request = match &game.program {
+                // Steam starts the game, so its overlay reaches it; Ubisoft Connect is opened
+                // first, outside Steam: when the game has to start it, the overlay breaks.
+                Some(program) => LaunchAndWait {
+                    launcher: program.exe.clone(),
+                    game_folder: game_folder.clone(),
+                    start_in: Some(program.working_directory.clone()),
+                    open_first: Some(OpenFirst {
+                        program: game.launcher.clone(),
+                        window: UBISOFT_CONNECT_WINDOW.to_string(),
+                    }),
+                    ..LaunchAndWait::default()
+                },
+                // Ubisoft Connect can't be asked to quit (a close request only hides it), so
+                // a Ubisoft Connect this launch started is ended after the game.
+                None => LaunchAndWait {
+                    launcher: game.launcher.clone(),
+                    link: Some(link),
+                    game_folder: game_folder.clone(),
+                    restart_launcher: game.restart_launcher,
+                    ..LaunchAndWait::default()
+                },
+            };
+            let target = request.shortcut_target(helper);
             return Shortcut::new(
                 "0",
                 &game.name,
@@ -84,6 +104,7 @@ mod tests {
             game_folder: Some(PathBuf::from(r"D:\UplayLibrary\Far Cry 3\")),
             helper: Some(PathBuf::from(r"C:\BoilR\BoilR.exe")),
             restart_launcher: true,
+            program: None,
         }
     }
 
@@ -94,6 +115,22 @@ mod tests {
         assert_eq!(
             shortcut.launch_options,
             r#"--launch-and-wait --game-folder "D:\UplayLibrary\Far Cry 3" --launcher "C:\Ubisoft Game Launcher\upc.exe" --link "uplay://launch/46/0" --restart-launcher"#
+        );
+    }
+
+    #[test]
+    fn starts_the_games_own_program_when_known() {
+        let game = UbisoftGame {
+            program: Some(super::super::catalogue::GameProgram {
+                exe: PathBuf::from(r"D:\UplayLibrary\Far Cry 3\bin\FC3Updater.exe"),
+                working_directory: PathBuf::from(r"D:\UplayLibrary\Far Cry 3"),
+            }),
+            ..far_cry_3()
+        };
+        let shortcut: ShortcutOwned = game.into();
+        assert_eq!(
+            shortcut.launch_options,
+            r#"--launch-and-wait --game-folder "D:\UplayLibrary\Far Cry 3" --launcher "D:\UplayLibrary\Far Cry 3\bin\FC3Updater.exe" --start-in "D:\UplayLibrary\Far Cry 3" --open-first "C:\Ubisoft Game Launcher\upc.exe" --open-first-window "Ubisoft Connect""#
         );
     }
 

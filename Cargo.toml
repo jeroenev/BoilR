@@ -75,6 +75,9 @@ winres = "^0.1.12"
 winreg = "^0.56.0"
 sqlite = "^0.37.3"
 roxmltree = "^0.21.1"
+# Already in the lockfile through winreg and sysinfo: no new crate. Reads Ubisoft Connect's
+# encrypted game catalogue (platforms/uplay/catalogue.rs).
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [target.'cfg(not(windows))'.dependencies]
 wayland-cursor = "0.31.7"

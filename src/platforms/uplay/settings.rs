@@ -12,6 +12,16 @@ pub struct UbisoftSettings {
     /// running at the time without its launcher.
     #[serde(default)]
     pub steam_overlay: bool,
+    /// Windows: let Steam start the game's own program, found in Ubisoft Connect's game
+    /// catalogue, instead of the game's `uplay://` link. The overlay then reaches the game
+    /// whether Ubisoft Connect is open or not, Ubisoft Connect is never closed, and Steam
+    /// shows Play again seconds after the game. Off by default: it reads Ubisoft Connect's
+    /// encrypted catalogue cache, whose format can change without notice, and newer games
+    /// may refuse to start this way (tried with Far Cry 3, Far Cry 4 and Assassin's Creed
+    /// IV). Games whose program isn't found, or that need arguments, keep the link. Takes
+    /// precedence over [`Self::steam_overlay`] for the games it finds.
+    #[serde(default)]
+    pub start_game_exe: bool,
 }
 
 impl Default for UbisoftSettings {
@@ -23,6 +33,7 @@ impl Default for UbisoftSettings {
         Self {
             enabled,
             steam_overlay: false,
+            start_game_exe: false,
         }
     }
 }
