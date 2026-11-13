@@ -46,14 +46,14 @@ Filled in by the user with a controller, Steam started normally.
 
 | Test | Result |
 |---|---|
-| 1a TEST EA7, EA app closed | **All yes:** Home opens the overlay, Resume works, controller works, F12 screenshot, EA app gone. But Play came back only **after** ~20 s, not sooner (agents measured 16–17 s: 5 s exit grace + 10 s cloud-save grace + closing the EA app). |
-| 1b TEST EA7, EA app open | All yes (signed in again without a prompt; Play again also only after ~20 s), **except F12: no screenshot** (once; not retried). |
+| 1a TEST EA7, EA app closed | **Yes:** Home opens the overlay, Resume works, F12 screenshot, EA app gone. **Controller layout: unclear**: the user answered "not sure what this means, controller input works as expected", so the shortcut's own Steam Input layout wasn't checked. But Play came back only **after** ~20 s, not sooner (agents measured 16–17 s: 5 s exit grace + 10 s cloud-save grace + closing the EA app). |
+| 1b TEST EA7, EA app open | Yes (signed in again without a prompt; Play again also only after ~20 s), **except F12: no screenshot** (once; not retried). Controller layout unclear, as 1a. |
 | 2 TEST EA6 (Play pressed in an EA app that Steam started) | **Works:** game starts, Home opens the overlay, Steam shows running until the EA app is exited (expected). Unlike EA R4, where the game was asked for with a link from outside. |
 | 3 Stop, shipped Alice shortcut | The game keeps running (expected). |
 | 3 Stop, TEST EA7 | Ends the game, but only after **about a minute** of hanging. |
 | 4a TEST UB1 FC3 exe, Ubisoft Connect closed | Resume, controller, quit → Play all fine, but **Home: the overlay flashes for a second and disappears** (sounds play, no usable UI). |
 | 4b Same, Ubisoft Connect open | **All yes.** |
-| 5 Far Cry 4, AC IV through their exe | **All yes.** The admin prompt (prerequisites) came once; gone on the second launch. AC IV needed the password once. |
+| 5 Far Cry 4, AC IV through their exe | **All yes** for what was asked. The admin prompt (prerequisites) came once; gone on the second launch. AC IV needed the password once. The checklist didn't ask whether Play came back after quitting AC IV. |
 | 6 TEST EA3 Resume prototype | **Doesn't work:** overlay sounds but nothing appears; Resume doesn't bring the game back. |
 | 6 TEST EA4 Overlay window prototype | **Unreliable:** the overlay sometimes appears; it works with the controller, but the game's controller input is broken afterwards (focus not given back). |
 | 7 Cloud saves, optional tests | Not done. |
@@ -97,7 +97,9 @@ game tracked, Shift+Tab overlay, Play again ~16 s after quitting (EA R14, R15).
 
 - [ ] Home in the game opens the Steam overlay (not Big Picture).
 - [ ] From Big Picture (Home → Library, or Alt+Tab to Steam), "Resume game" returns to the game.
-- [ ] The shortcut's controller layout works in the game.
+- [ ] The shortcut's controller layout works in the game: in Steam, change one button in the
+  shortcut's controller layout (for example swap A and B), and check that the game sees the
+  change. Change it back afterwards.
 - [ ] F12 makes a screenshot.
 - [ ] Quit from the game's menu: within ~20 s Steam shows Play and the EA app is gone from the tray.
 - [ ] 1b only: the EA app comes back signed in, without a prompt.

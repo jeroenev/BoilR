@@ -173,17 +173,20 @@ between a fast Play button and a cut-off upload, which users can't judge.
 
 ## Not yet tried
 
-From a review of these reports on 2026-11-11. Launcher-specific items are at the end of the
-[EA](ea-app.md#not-yet-tried-review-of-2026-11-11) and
-[Ubisoft](ubisoft-connect.md#not-yet-tried-review-of-2026-11-11) reports.
+From a review of these reports on 2026-11-11, updated with the user tests of 2026-11-13.
+Launcher-specific items are under "Still open" at the end of the [EA](ea-app.md#still-open)
+and [Ubisoft](ubisoft-connect.md#still-open) reports.
 
 Untested parts of the wait helper:
 
-- **Steam's Stop** while BoilR waits: Steam ends BoilR only; the game, outside the tree,
-  probably keeps running.
+- ~~**Steam's Stop** while BoilR waits~~: tested (user test 3). With the launcher outside
+  Steam's tree, Stop ends BoilR only and the game keeps running; with the launcher inside it
+  (TEST EA7), Stop ends the game, after about a minute (see the EA report's round 5).
 - **Other Steam features**: Steam Input (the shortcut's controller layout), playtime, "In
-  game" for friends, F12 screenshots, game recording. The first three likely follow the
-  running status; screenshots and recording need the overlay.
+  game" for friends, game recording. F12 screenshots worked with TEST EA7 except once (user
+  test 1b). The controller layout was asked but not really checked (the user saw controller
+  input work, not the shortcut's own layout). The rest likely follow the running status;
+  recording needs the overlay.
 - **Harder cases**: the launcher asking for a login or an update first (10-minute limit),
   games that start a second launcher, games running a program from outside their install
   folder, two games from the same launcher at once.
@@ -191,8 +194,10 @@ Untested parts of the wait helper:
 Status after round 2: the EA app and Ubisoft Connect both give the real Steam overlay when
 Steam starts them (EA) or the game's exe (Ubisoft); see the reports. Options 1 and 2 below
 only matter where that isn't possible (EA app already running and not to be restarted). Both
-exist as a prototype not yet tried through Steam ([`tools/boilr-proto`](tools/boilr-proto/),
-`--mode resume|overlay`); option 3 was tried: dead end (EA R11).
+were built as a prototype ([`tools/boilr-proto`](tools/boilr-proto/), `--mode
+resume|overlay`) and tried through Steam in user test 6: Resume forwarding doesn't work, the
+overlay window is unreliable and leaves the game without controller focus. Dropped. Option 3
+was tried too: dead end (EA R11).
 
 Options:
 
@@ -219,8 +224,9 @@ Online search for a way to get Steam's overlay into launcher-started games:
   [1](https://steamcommunity.com/app/1774580/discussions/0/4849903519807001192),
   [2](https://steamcommunity.com/app/1774580/discussions/0/4200238624228210446)) and for
   Ubisoft Connect in older threads
-  ([Steam forum](https://steamcommunity.com/discussions/forum/1/592889669725736425/)). Fails
-  today for the EA app; works for Ubisoft Connect (see the reports).
+  ([Steam forum](https://steamcommunity.com/discussions/forum/1/592889669725736425/)). Works
+  for both today (EA R2/R5 and user test 2; Ubisoft U2b/U6). Round 1 seemed to show it failing
+  for the EA app, but that came from the test setup (see the testing pitfall above).
 - **GloSC / [GlosSI](https://github.com/Alia5/GlosSI):** draws the overlay in its own
   transparent window that Steam starts, not in the game. Discontinued.
 - **Injecting `GameOverlayRenderer64.dll`:** only at process start (for example a

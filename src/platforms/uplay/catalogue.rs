@@ -8,6 +8,10 @@
 //! `docs/launcher-investigations/ubisoft-connect.md` ("Exe paths").
 //!
 //! Everything here fails soft: a game whose program isn't found keeps its `uplay://` link.
+//!
+//! Only Windows reads the catalogue (`game_programs`); elsewhere the parsing below is only
+//! used by the tests, which still run there.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 /// A game's own program, as Ubisoft Connect starts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
