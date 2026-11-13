@@ -57,8 +57,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Some games restart themselves or hand over from a small launcher to the game.
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// How long a launcher gets after the game, to upload cloud saves, before it is closed, when
-/// its log can't tell when it is done.
-const CLOUD_SAVE_GRACE: Duration = Duration::from_secs(15);
+/// its log can't tell when it is done. Ubisoft Connect showed a Far Cry 3 save uploaded within
+/// 2 s of the game closing (user test, 2026-11-13); this comes after the 5 s exit check.
+const CLOUD_SAVE_GRACE: Duration = Duration::from_secs(5);
 /// With a cloud sync log: how long to wait for the sync to start, after the game closed.
 const SYNC_START_WAIT: Duration = Duration::from_secs(10);
 /// With a cloud sync log: how long a started sync may take. The EA app itself gives up on
@@ -68,9 +69,11 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a launcher opened before the game gets to be ready: the user may have to sign in.
 const OPEN_FIRST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// How long to give a launcher that says it is ready before the game starts: Ubisoft
-/// Connect loads the account's games a second or two after signing in, and a game that
-/// connects before that gets "Ownership connection is not set up" and a recovery page.
+/// How long to give a launcher that says it is ready before the game starts. Ubisoft
+/// Connect loads the account's games 1–2 s after signing in, and a game that connected at
+/// the same second got "Ownership connection is not set up" and a recovery page. After 1 s
+/// that error was gone, but Steam's overlay didn't show in the game (user, round 8): Ubisoft
+/// Connect is still starting up. After 5 s both worked (user, round 7).
 const OPEN_FIRST_SETTLE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_secs(1);
 

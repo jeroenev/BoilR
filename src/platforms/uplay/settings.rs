@@ -11,7 +11,7 @@ pub struct UbisoftSettings {
     /// its downloads and leaves another Ubisoft game running at the time without its
     /// launcher.
     ///
-    /// Either way, a Ubisoft Connect that a game's shortcut started is asked to quit 15
+    /// Either way, a Ubisoft Connect that a game's shortcut started is asked to quit 5
     /// seconds after the game (its `closebehavior` is set to quit for that while), and ended
     /// if it doesn't. Its quit doesn't wait for cloud-save uploads; a cut-off upload is
     /// probably retried when that game next starts.
