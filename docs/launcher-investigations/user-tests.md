@@ -6,8 +6,8 @@ Filled in by the user with a controller, Steam started normally.
 
 | Test | Result |
 |---|---|
-| 1a TEST EA7, EA app closed | **All yes:** Home opens the overlay, Resume works, controller works, F12 screenshot, Play again within ~20 s and the EA app gone. |
-| 1b TEST EA7, EA app open | All yes (signed in again without a prompt), **except F12: no screenshot** (once; not retried). |
+| 1a TEST EA7, EA app closed | **All yes:** Home opens the overlay, Resume works, controller works, F12 screenshot, EA app gone. But Play came back only **after** ~20 s, not sooner (agents measured 16–17 s: 5 s exit grace + 10 s cloud-save grace + closing the EA app). |
+| 1b TEST EA7, EA app open | All yes (signed in again without a prompt; Play again also only after ~20 s), **except F12: no screenshot** (once; not retried). |
 | 2 TEST EA6 (Play pressed in an EA app that Steam started) | **Works:** game starts, Home opens the overlay, Steam shows running until the EA app is exited (expected). Unlike EA R4, where the game was asked for with a link from outside. |
 | 3 Stop, shipped Alice shortcut | The game keeps running (expected). |
 | 3 Stop, TEST EA7 | Ends the game, but only after **about a minute** of hanging. |
@@ -21,7 +21,10 @@ Filled in by the user with a controller, Steam started normally.
 Conclusions:
 
 - **EA:** `EALauncher.exe` + `--restart-launcher` is the way (tracking, overlay, Resume, Play
-  again). Open: the minute-long Stop, and the one missed F12 screenshot.
+  again). Open: the minute-long Stop, the one missed F12 screenshot, and the ~20 s until Play.
+  The wait can shrink: the EA app logs `Post game cloud sync completed successfully` ~1 s
+  after the game (EA R16), so BoilR could close it on that line instead of after the fixed
+  10 s grace, ideally with `WM_CLOSE` (EA R17).
 - **Ubisoft:** the game's own exe works when Ubisoft Connect is already running; when the game
   has to start Ubisoft Connect itself, the overlay breaks (likely Ubisoft Connect's window or
   its own overlay taking over as it starts). A helper could start Ubisoft Connect through
