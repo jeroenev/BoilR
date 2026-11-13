@@ -24,16 +24,21 @@ the case where the overlay flashed and disappeared (4a); now BoilR opens Ubisoft
 - [ ] "Resume game" returns to the game.
 - [ ] Quit: Play within ~10 s; Ubisoft Connect stays in the tray.
 
-**R5-4. TEST UB3 FC3 helper default** (9439222288433020928), Ubisoft Connect closed.
+**R5-4. TEST UB11 FC3 helper clean quit** (9960740706689482752), Ubisoft Connect closed.
+This is what the default Ubisoft shortcut does since round 6 (TEST UB3 is the round 5 version,
+which ends Ubisoft Connect instead).
 - [ ] Home opens the Steam overlay.
 - [ ] Quit: Play within ~30 s (was: never), and Ubisoft Connect is gone from the tray.
+- [ ] Afterwards, Ubisoft Connect's X button still hides it in the tray (its setting was put
+  back).
 
 **R5-5. Cloud saves**, with a save made in the game before quitting (note the time):
 - [ ] Alice through **TEST EA8** (EA app closed): Play comes back and the EA app closes
   without a "Saving your progress" dialog. BoilR's log should show `the launcher's cloud
   sync is done` before `asking the launcher to close`.
-- [ ] Far Cry 3 through **TEST UB3** (Ubisoft Connect closed): afterwards, does Ubisoft
-  Connect show the save as synced the next time it starts (no conflict prompt)?
+- [ ] Far Cry 3 through **TEST UB11** (Ubisoft Connect closed): afterwards, does Ubisoft
+  Connect show the save as synced the next time it starts (no conflict prompt)? Also look in
+  `<Ubisoft Game Launcher>\savegames\<user id>\46\` for a leftover `*.save.upload` file.
 
 **R5-6. Optional: the real shortcuts.** Run an import in BoilR (it rewrites the EA and Ubisoft
 shortcuts with the new arguments). For the Ubisoft own-program route, turn on "Start the game's

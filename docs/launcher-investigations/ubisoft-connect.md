@@ -157,8 +157,33 @@ That stops a running download and could cut off an upload. Two alternatives were
 |---|---|---|---|
 | U13 | (b) Clean quit: `closebehavior: CloseBehavior_Close` set in `settings.yaml` while Ubisoft Connect was closed, TEST UB2 (Steam starts `upc.exe` with the link), game ended, then a close request to the "Ubisoft Connect" windows 5 s later | closed | Overlay as usual. Close request to 3 windows; log `Received shutdown request, reason: 1`, `Received shutdown message (quit), returnCode: 0`; all programs gone **7.5 s** later; **Steam back to Play 12 s after the game** (forced: 24 s). Ubisoft Connect wrote `settings.yaml` back on exit with the changed value, so restoring must happen after it exits. |
 | U14 | (c) TEST UB10: BoilR with `--launcher explorer.exe --link uplay://launch/46/0` | closed | Ubisoft Connect starts outside Steam's tree. **No Steam overlay** (no `gameoverlayrenderer.dll` in the game, Ubisoft's own overlay only). Steam back to Play 7 s after the game; Ubisoft Connect stays open. |
+| U15 | (b) as BoilR does it now: TEST UB11 (`--close-window "Ubisoft Connect" --setting-file ...settings.yaml --setting-from "closebehavior: CloseBehavior_Minimize" --setting-to "closebehavior: CloseBehavior_Close"`) | closed | `changed the launcher's setting for this launch`, overlay as usual, after the game 15 s wait, `asking the launcher to close`, quit after 6 s (`returnCode: 0`), `changed the launcher's setting back` (file back to `CloseBehavior_Minimize`). **Steam back to Play 28.5 s after the game.** |
 
-**Does a clean quit wait for cloud saves?** Unknown.
+Chosen: (b), with the 15 s wait kept (the user, 2026-11-13).
+
+**Does a clean quit wait for cloud saves?** Probably not.
+- An agent read Ubisoft Connect's memory (its `upc.exe` and `UplayService.exe` are packed by a
+  custom packer: `.text`/`.data` empty on disk, a 17 MB `.ubx2` section at entropy 7.97).
+  `biz\misc\Shutdown.cpp` has two outcomes, `Shutdown aborted due to game running` and
+  `Proceeding to shutdown`; the shutdown messages have one failure,
+  `MessageShutdownFailedGameRunning`, and none for a sync. No quit-time sync text exists.
+  Medium-high confidence (absence of strings, not read code).
+- Uploads run at game end: `CloudSaveSyncGameEnd.cpp`, `CloudSaveUpload.cpp`,
+  `BusCloudSave.cpp` (`Synchronization job on game end should be completed.`), usage fields
+  `When = START|END`, `Direction = UPLOAD|DOWNLOAD`. Successful syncs aren't logged at all.
+- Next to `CloudSaveSyncGameStart.cpp`: `Fail to get a timestamp from upload marker`, `Failed
+  to delete upload marker`, `*.upload`, `*.delete`. So `N.save.upload` most likely marks a
+  slot that changed and isn't confirmed uploaded, and the next game start's sync handles it:
+  a cut-off upload would be retried then (inferred, not confirmed).
+- Online (no official answer): players wait at least 10 s before closing Ubisoft Connect;
+  others also find stray 0-byte `.save.upload` files; Playnite closes Ubisoft Connect after a
+  game with `taskkill`, then `taskkill /f` after 3 s; GOG Galaxy's plugin uses `taskkill`
+  without `/f`. No reports of saves lost that way. Sources:
+  [Shadows thread](https://steamcommunity.com/app/3159330/discussions/1/591767099278427310),
+  [Playnite UplayClient.cs](https://github.com/JosefNemec/PlayniteExtensions/blob/master/source/Libraries/UplayLibrary/UplayClient.cs),
+  [GOG Galaxy plugin](https://github.com/FriendsOfGalaxy/galaxy-integration-uplay/blob/master/src/plugin.py).
+
+Earlier notes, before the analysis:
 - Ubisoft Connect logs no sync start or end around a game's exit (`Game process ended`, `Play
   session ... deleted`, nothing else), and its programs carry no readable shutdown strings
   (packed).
@@ -184,5 +209,6 @@ That stops a running download and could cut off an upload. Two alternatives were
   games whose exe is a separate launcher.
 - A real cloud-save signal: rerun U8 after saving in the game.
 - The default helper with Ubisoft Connect closed (U2b) left Steam showing "running". Fixed in
-  round 5: BoilR ends a Ubisoft Connect it started (U9). The 15 s wait before that is a guess
-  without a cloud-save signal (U8); a real save upload is still untested.
+  round 5: BoilR ends a Ubisoft Connect it started (U9); since round 6 it asks it to quit
+  instead (U15). The 15 s wait before that is a guess without a cloud-save signal (U8, round
+  6); a real save upload is still untested.
