@@ -8,16 +8,23 @@
 //! this mode: BoilR starts the launcher with the game's link, as its own child so Steam keeps
 //! tracking it, and stays alive while any program from the game's folder runs.
 //!
-//! With [`LaunchAndWait::restart_launcher`] BoilR also closes the launcher before and after
-//! the game. Ubisoft Connect needs this for the Steam overlay: the overlay only reaches a game
-//! when Steam started Ubisoft Connect itself, and Steam then counts the game as running until
-//! Ubisoft Connect closes. Ubisoft Connect has no way to be asked to quit from outside (a
-//! window close request only hides it), so it is ended after a grace period for cloud saves.
+//! Steam's overlay (and Big Picture's Resume) only reaches a game that Steam's own process
+//! tree started. When the launcher is closed, BoilR's launch starts it inside that tree, so
+//! the game gets the overlay; Steam then counts the game as running until the launcher
+//! closes. So BoilR closes a launcher it started, once the game has closed and the launcher
+//! has had time for cloud saves ([`LaunchAndWait::cloud_sync`]). A launcher that was already
+//! open is left alone: it takes the link over, outside Steam's tree, without the overlay.
+//! With [`LaunchAndWait::restart_launcher`] BoilR also closes an open launcher before the
+//! game, so the overlay always reaches it.
+//!
+//! A shortcut can also start the game's own program instead of a launcher (no link). Steam
+//! then starts the game itself; [`LaunchAndWait::open_first`] opens the launcher beforehand,
+//! outside Steam's tree, for games that need it running.
 //!
 //! What happens is written to `launch-and-wait.log` in BoilR's config folder.
 
 use std::{
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
     thread::sleep,
@@ -31,18 +38,34 @@ pub const FLAG: &str = "--launch-and-wait";
 const GAME_FOLDER: &str = "--game-folder";
 const LAUNCHER: &str = "--launcher";
 const LINK: &str = "--link";
+const START_IN: &str = "--start-in";
 const RESTART_LAUNCHER: &str = "--restart-launcher";
+const CLOSE_WINDOW: &str = "--close-window";
+const SYNC_LOG: &str = "--sync-log";
+const SYNC_STARTED: &str = "--sync-started";
+const SYNC_DONE: &str = "--sync-done";
+const OPEN_FIRST: &str = "--open-first";
+const OPEN_FIRST_WINDOW: &str = "--open-first-window";
 
 /// How long the launcher gets to start the game: it may log in or update the game first.
 const START_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long no program from the game's folder may run before the game counts as closed.
 /// Some games restart themselves or hand over from a small launcher to the game.
 const EXIT_GRACE: Duration = Duration::from_secs(5);
-/// How long a restarted launcher gets after the game, to upload cloud saves, before it is
-/// closed.
-const CLOUD_SAVE_GRACE: Duration = Duration::from_secs(10);
+/// How long a launcher gets after the game, to upload cloud saves, before it is closed, when
+/// its log can't tell when it is done.
+const CLOUD_SAVE_GRACE: Duration = Duration::from_secs(15);
+/// With a cloud sync log: how long to wait for the sync to start, after the game closed.
+const SYNC_START_WAIT: Duration = Duration::from_secs(10);
+/// With a cloud sync log: how long a started sync may take. The EA app itself gives up on
+/// shutting down after 60 seconds.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a launcher that is being closed gets to go away.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a launcher opened before the game gets to show its window.
+const OPEN_FIRST_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to give a launcher whose window just appeared before the game starts.
+const OPEN_FIRST_SETTLE: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_secs(1);
 
 /// The program shortcuts run in this mode: the BoilR that is importing them, on Windows.
@@ -68,17 +91,47 @@ pub fn run_if_asked(args: &[String]) -> Option<eyre::Result<()>> {
     Some(result)
 }
 
-/// One game to start through its launcher and wait for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One game to start and wait for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LaunchAndWait {
-    /// The program that starts the game, such as `EALauncher.exe` or `upc.exe`.
+    /// The program that starts the game: a launcher such as `EALauncher.exe` or `upc.exe`
+    /// (or `explorer.exe`, which hands the link to whatever opens it) when there is a
+    /// [`Self::link`], or else the game's own program.
     pub launcher: PathBuf,
     /// The launcher's argument: the game's link (`origin2://...`, `uplay://...`).
-    pub link: String,
+    pub link: Option<String>,
     /// The game's install folder. The game counts as running while a program from it runs.
     pub game_folder: PathBuf,
-    /// Close the launcher before the game, so this run starts it, and after the game.
+    /// The folder the launcher starts in; its own folder when not given.
+    pub start_in: Option<PathBuf>,
+    /// Close an open launcher before the game too, so this launch starts it.
     pub restart_launcher: bool,
+    /// The title of the launcher's window that, sent a close request, quits the launcher
+    /// cleanly (the EA app's "EA"). Without it, or when that doesn't work, the launcher's
+    /// programs are ended.
+    pub close_window: Option<String>,
+    /// The launcher's log, to see when its cloud sync after the game is done.
+    pub cloud_sync: Option<CloudSyncLog>,
+    /// A launcher to open, outside Steam's tree, before the game's own program starts.
+    pub open_first: Option<OpenFirst>,
+}
+
+/// Where a launcher logs its cloud sync after a game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudSyncLog {
+    pub file: PathBuf,
+    /// Text in a line the launcher writes when it starts syncing after a game.
+    pub started: String,
+    /// Text in a line the launcher writes when that sync has ended, successfully or not.
+    pub done: String,
+}
+
+/// A launcher to have running before the game starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFirst {
+    pub program: PathBuf,
+    /// The title of the window that shows it is up ("Ubisoft Connect").
+    pub window: String,
 }
 
 /// What a Steam shortcut runs: its `Exe`, `StartDir` and `LaunchOptions`.
@@ -92,15 +145,38 @@ pub struct ShortcutTarget {
 impl LaunchAndWait {
     /// The shortcut that runs `helper` (a BoilR executable) in this mode.
     pub fn shortcut_target(&self, helper: &Path) -> ShortcutTarget {
-        let mut launch_options = format!(
-            "{FLAG} {GAME_FOLDER} {} {LAUNCHER} {} {LINK} {}",
-            quoted(&self.game_folder.to_string_lossy()),
-            quoted(&self.launcher.to_string_lossy()),
-            quoted(&self.link),
-        );
+        let path = |path: &Path| quoted(&path.to_string_lossy());
+        let mut options = vec![
+            FLAG.to_string(),
+            GAME_FOLDER.to_string(),
+            path(&self.game_folder),
+            LAUNCHER.to_string(),
+            path(&self.launcher),
+        ];
+        let mut add = |name: &str, value: String| {
+            options.push(name.to_string());
+            options.push(value);
+        };
+        if let Some(link) = &self.link {
+            add(LINK, quoted(link));
+        }
+        if let Some(folder) = &self.start_in {
+            add(START_IN, path(folder));
+        }
+        if let Some(title) = &self.close_window {
+            add(CLOSE_WINDOW, quoted(title));
+        }
+        if let Some(sync) = &self.cloud_sync {
+            add(SYNC_LOG, path(&sync.file));
+            add(SYNC_STARTED, quoted(&sync.started));
+            add(SYNC_DONE, quoted(&sync.done));
+        }
+        if let Some(first) = &self.open_first {
+            add(OPEN_FIRST, path(&first.program));
+            add(OPEN_FIRST_WINDOW, quoted(&first.window));
+        }
         if self.restart_launcher {
-            launch_options.push(' ');
-            launch_options.push_str(RESTART_LAUNCHER);
+            options.push(RESTART_LAUNCHER.to_string());
         }
         ShortcutTarget {
             exe: quoted(&helper.to_string_lossy()),
@@ -108,7 +184,7 @@ impl LaunchAndWait {
                 .parent()
                 .map(|folder| quoted(&folder.to_string_lossy()))
                 .unwrap_or_default(),
-            launch_options,
+            launch_options: options.join(" "),
         }
     }
 
@@ -118,22 +194,61 @@ impl LaunchAndWait {
         if !args.iter().any(|arg| arg == FLAG) {
             return None;
         }
-        let value = |name: &str| {
-            args.iter()
-                .position(|arg| arg == name)
-                .and_then(|at| args.get(at + 1))
+        // `Ok(None)` when the flag is missing, an error when it has no value.
+        let optional = |name: &str| -> eyre::Result<Option<String>> {
+            let Some(at) = args.iter().position(|arg| arg == name) else {
+                return Ok(None);
+            };
+            args.get(at + 1)
                 .filter(|value| !value.starts_with("--"))
                 .cloned()
+                .map(Some)
                 .ok_or_else(|| eyre::format_err!("{FLAG} needs {name} <value>"))
         };
+        let required = |name: &str| {
+            optional(name)?.ok_or_else(|| eyre::format_err!("{FLAG} needs {name} <value>"))
+        };
         Some((|| {
+            let cloud_sync = match optional(SYNC_LOG)? {
+                Some(file) => Some(CloudSyncLog {
+                    file: PathBuf::from(file),
+                    started: required(SYNC_STARTED)?,
+                    done: required(SYNC_DONE)?,
+                }),
+                None => None,
+            };
+            let open_first = match optional(OPEN_FIRST)? {
+                Some(program) => Some(OpenFirst {
+                    program: PathBuf::from(program),
+                    window: required(OPEN_FIRST_WINDOW)?,
+                }),
+                None => None,
+            };
             Ok(LaunchAndWait {
-                launcher: PathBuf::from(value(LAUNCHER)?),
-                link: value(LINK)?,
-                game_folder: PathBuf::from(value(GAME_FOLDER)?),
+                launcher: PathBuf::from(required(LAUNCHER)?),
+                link: optional(LINK)?,
+                game_folder: PathBuf::from(required(GAME_FOLDER)?),
+                start_in: optional(START_IN)?.map(PathBuf::from),
                 restart_launcher: args.iter().any(|arg| arg == RESTART_LAUNCHER),
+                close_window: optional(CLOSE_WINDOW)?,
+                cloud_sync,
+                open_first,
             })
         })())
+    }
+
+    /// The folder of the launcher BoilR may close: none when the game's own program is
+    /// started (no link), or when Explorer opens the link (its folder is Windows' own).
+    fn launcher_folder(&self) -> Option<Folder> {
+        self.link.as_ref()?;
+        let through_explorer = self
+            .launcher
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"));
+        if through_explorer {
+            return None;
+        }
+        self.launcher.parent().map(Folder::new)
     }
 
     /// Starts the game and returns once it has closed (or never started).
@@ -145,21 +260,41 @@ impl LaunchAndWait {
             eyre::bail!("{} is not a game folder", self.game_folder.display());
         }
         let game_folder = Folder::new(&self.game_folder);
+        let launcher_folder = self.launcher_folder();
         let mut processes = Processes::new();
+        // Whether this launch starts the launcher, inside Steam's tree. Then it is closed
+        // after the game, or Steam would count the game as running until it closes.
+        let mut starts_launcher = false;
+        let mut sync_log_start = 0;
         if processes.any_in(&game_folder) {
             log.line("the game is already running; waiting for it");
         } else {
-            if self.restart_launcher {
-                self.close_launcher(&mut processes, &mut log);
+            if let Some(folder) = &launcher_folder {
+                let was_running = processes.count_directly_in(folder) > 0;
+                if was_running && self.restart_launcher {
+                    self.close_launcher(folder, &mut processes, &mut log);
+                }
+                starts_launcher = !was_running || self.restart_launcher;
+                log.line(if starts_launcher {
+                    "this launch starts the launcher; it is closed after the game"
+                } else {
+                    "the launcher is open; it takes the game over and stays open"
+                });
             }
+            if let Some(first) = &self.open_first {
+                open_first(first, &mut processes, &mut log)?;
+            }
+            sync_log_start = self.cloud_sync.as_ref().map_or(0, CloudSyncLog::length);
             let mut command = Command::new(&self.launcher);
-            // Quoted, as Steam passes it: `arg` only quotes values with spaces, and
-            // explorer.exe ignores an unquoted `origin2://...?offerIds=...` link.
-            #[cfg(windows)]
-            std::os::windows::process::CommandExt::raw_arg(&mut command, quoted(&self.link));
-            #[cfg(not(windows))]
-            command.arg(&self.link);
-            if let Some(folder) = self.launcher.parent() {
+            if let Some(link) = &self.link {
+                // Quoted, as Steam passes it: `arg` only quotes values with spaces, and
+                // explorer.exe ignores an unquoted `origin2://...?offerIds=...` link.
+                #[cfg(windows)]
+                std::os::windows::process::CommandExt::raw_arg(&mut command, quoted(link));
+                #[cfg(not(windows))]
+                command.arg(link);
+            }
+            if let Some(folder) = self.start_in.as_deref().or(self.launcher.parent()) {
                 command.current_dir(folder);
             }
             // Not waited for: EALauncher.exe exits at once, Ubisoft Connect keeps running.
@@ -184,43 +319,207 @@ impl LaunchAndWait {
         }
         log.line("the game closed");
 
-        if self.restart_launcher {
-            sleep(CLOUD_SAVE_GRACE);
+        if let (true, Some(folder)) = (starts_launcher, &launcher_folder) {
+            self.wait_for_cloud_sync(sync_log_start, &mut log);
             if processes.any_in(&game_folder) {
                 log.line("the game started again; leaving the launcher open");
             } else {
-                self.close_launcher(&mut processes, &mut log);
+                self.close_launcher(folder, &mut processes, &mut log);
             }
         }
         Ok(())
     }
 
-    /// Ends the programs in the launcher's own folder (not in folders below it, where games
-    /// can be installed), and waits for them to go.
-    fn close_launcher(&self, processes: &mut Processes, log: &mut Log) {
-        let Some(folder) = self.launcher.parent() else {
+    /// Waits until the launcher is done with cloud saves after the game: until its log says
+    /// so, or for a fixed time when there is no log to read.
+    fn wait_for_cloud_sync(&self, log_start: u64, log: &mut Log) {
+        let Some(sync) = &self.cloud_sync else {
+            sleep(CLOUD_SAVE_GRACE);
             return;
         };
-        // A link opened through Explorer: its folder is Windows' own.
-        let through_explorer = self
-            .launcher
-            .file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"));
-        if through_explorer {
-            return;
-        }
-        let folder = Folder::new(folder);
-        let ended = processes.kill_directly_in(&folder);
-        if ended == 0 {
-            return;
-        }
-        log.line(&format!("closing the launcher ({ended} programs)"));
-        let asked = Instant::now();
-        while processes.count_directly_in(&folder) > 0 && asked.elapsed() < CLOSE_TIMEOUT {
+        let waiting = Instant::now();
+        loop {
+            let written = sync.written_since(log_start);
+            if written.contains(&sync.done) {
+                log.line("the launcher's cloud sync is done");
+                return;
+            }
+            let limit = if written.contains(&sync.started) {
+                SYNC_TIMEOUT
+            } else {
+                SYNC_START_WAIT
+            };
+            if waiting.elapsed() >= limit {
+                log.line(&format!(
+                    "no end of a cloud sync in the launcher's log after {limit:?}"
+                ));
+                return;
+            }
             sleep(POLL);
-            processes.kill_directly_in(&folder);
         }
     }
+
+    /// Closes the programs in the launcher's own folder (not in folders below it, where
+    /// games can be installed), and waits for them to go: first by asking its window to
+    /// close, then by ending them.
+    fn close_launcher(&self, folder: &Folder, processes: &mut Processes, log: &mut Log) {
+        if processes.count_directly_in(folder) == 0 {
+            return;
+        }
+        if let Some(title) = &self.close_window {
+            let asked = ask_windows_to_close(&processes.pids_directly_in(folder), title);
+            if asked > 0 {
+                log.line("asking the launcher to close");
+                let asked = Instant::now();
+                while processes.count_directly_in(folder) > 0 && asked.elapsed() < CLOSE_TIMEOUT {
+                    sleep(POLL);
+                }
+                let left = processes.count_directly_in(folder);
+                if left == 0 {
+                    log.line(&format!("the launcher closed after {:?}", asked.elapsed()));
+                    return;
+                }
+                log.line(&format!(
+                    "the launcher did not close ({left} programs left)"
+                ));
+            }
+        }
+        let ended = processes.kill_directly_in(folder);
+        log.line(&format!("ending the launcher ({ended} programs)"));
+        let ending = Instant::now();
+        while processes.count_directly_in(folder) > 0 && ending.elapsed() < CLOSE_TIMEOUT {
+            sleep(POLL);
+            processes.kill_directly_in(folder);
+        }
+    }
+}
+
+impl CloudSyncLog {
+    fn length(&self) -> u64 {
+        std::fs::metadata(&self.file).map_or(0, |meta| meta.len())
+    }
+
+    /// What the launcher wrote to its log after `start` bytes. All of it when the log is
+    /// shorter than that: it started over.
+    fn written_since(&self, start: u64) -> String {
+        // std opens files shared for reading and writing: the launcher keeps writing to it.
+        let Ok(mut file) = std::fs::File::open(&self.file) else {
+            return String::new();
+        };
+        let start = if self.length() < start { 0 } else { start };
+        let mut bytes = Vec::new();
+        if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err() {
+            return String::new();
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Opens `first` through Explorer, so it runs outside Steam's tree, unless a program from
+/// its folder already runs, and waits until its window shows.
+fn open_first(first: &OpenFirst, processes: &mut Processes, log: &mut Log) -> eyre::Result<()> {
+    let Some(folder) = first.program.parent().map(Folder::new) else {
+        return Ok(());
+    };
+    if processes.count_directly_in(&folder) > 0 {
+        return Ok(());
+    }
+    log.line("opening the launcher first");
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let mut command = Command::new(Path::new(&root).join("explorer.exe"));
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::raw_arg(
+        &mut command,
+        quoted(&first.program.to_string_lossy()),
+    );
+    #[cfg(not(windows))]
+    command.arg(&first.program);
+    command.spawn()?;
+    let opened = Instant::now();
+    while opened.elapsed() < OPEN_FIRST_TIMEOUT {
+        sleep(POLL);
+        if has_window(&processes.pids_directly_in(&folder), &first.window) {
+            log.line(&format!(
+                "the launcher showed its window after {:?}",
+                opened.elapsed()
+            ));
+            sleep(OPEN_FIRST_SETTLE);
+            return Ok(());
+        }
+    }
+    log.line("the launcher showed no window; starting the game anyway");
+    Ok(())
+}
+
+/// The top-level windows titled `title` of the programs `pids`. Process ids are only used
+/// within a moment here, never stored: this runs on Windows only (no Flatpak namespaces).
+#[cfg(windows)]
+fn windows_titled(pids: &[u32], title: &str) -> Vec<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId,
+    };
+
+    struct Search<'a> {
+        pids: &'a [u32],
+        title: &'a str,
+        found: Vec<HWND>,
+    }
+
+    unsafe extern "system" fn each(window: HWND, search: LPARAM) -> windows_sys::core::BOOL {
+        // SAFETY: `search` is the `Search` passed to EnumWindows below, alive for the call.
+        let search = unsafe { &mut *(search as *mut Search) };
+        let mut pid = 0u32;
+        // SAFETY: a window handle from EnumWindows and a valid out pointer.
+        unsafe { GetWindowThreadProcessId(window, &mut pid) };
+        if search.pids.contains(&pid) {
+            let mut text = [0u16; 256];
+            // SAFETY: the buffer's length is passed along.
+            let length = unsafe { GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32) };
+            let length = usize::try_from(length).unwrap_or(0).min(text.len());
+            if text.get(..length).map(String::from_utf16_lossy).as_deref() == Some(search.title) {
+                search.found.push(window);
+            }
+        }
+        1
+    }
+
+    let mut search = Search {
+        pids,
+        title,
+        found: Vec::new(),
+    };
+    // SAFETY: `each` only uses `search` while EnumWindows runs.
+    unsafe { EnumWindows(Some(each), &mut search as *mut Search as LPARAM) };
+    search.found
+}
+
+/// Sends a close request to the windows titled `title` of the programs `pids`; returns how
+/// many there were.
+#[cfg(windows)]
+fn ask_windows_to_close(pids: &[u32], title: &str) -> usize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+    let windows = windows_titled(pids, title);
+    for window in &windows {
+        // SAFETY: posting a message needs no memory from us.
+        unsafe { PostMessageW(*window, WM_CLOSE, 0, 0) };
+    }
+    windows.len()
+}
+
+#[cfg(windows)]
+fn has_window(pids: &[u32], title: &str) -> bool {
+    !windows_titled(pids, title).is_empty()
+}
+
+#[cfg(not(windows))]
+fn ask_windows_to_close(_pids: &[u32], _title: &str) -> usize {
+    0
+}
+
+#[cfg(not(windows))]
+fn has_window(_pids: &[u32], _title: &str) -> bool {
+    false
 }
 
 /// `value` in double quotes for a Windows command line. Quotes inside are dropped, and so
@@ -325,6 +624,17 @@ impl Processes {
             .count()
     }
 
+    /// The process ids of the programs in `folder` itself, for finding their windows.
+    fn pids_directly_in(&mut self, folder: &Folder) -> Vec<u32> {
+        self.refresh();
+        self.system
+            .processes()
+            .iter()
+            .filter(|(_, process)| process.exe().is_some_and(|exe| folder.holds_directly(exe)))
+            .map(|(pid, _)| pid.as_u32())
+            .collect()
+    }
+
     /// Ends the programs in `folder` itself; returns how many there were.
     fn kill_directly_in(&mut self, folder: &Folder) -> usize {
         self.refresh();
@@ -382,10 +692,27 @@ mod tests {
     fn alice() -> LaunchAndWait {
         LaunchAndWait {
             launcher: PathBuf::from(r"C:\EA Desktop\EALauncher.exe"),
-            link: "origin2://game/launch?offerIds=alice2_dd".to_string(),
+            link: Some("origin2://game/launch?offerIds=alice2_dd".to_string()),
             game_folder: PathBuf::from(r"D:\OriginLibrary\Alice Madness Returns\"),
-            restart_launcher: false,
+            ..LaunchAndWait::default()
         }
+    }
+
+    /// A command line split as Windows does for these values: at spaces outside quotes, and
+    /// without the quotes.
+    fn split(line: &str) -> Vec<String> {
+        let mut args = vec![];
+        let mut current = String::new();
+        let mut quoted = false;
+        for char in line.chars() {
+            match char {
+                '"' => quoted = !quoted,
+                ' ' if !quoted => args.push(std::mem::take(&mut current)),
+                _ => current.push(char),
+            }
+        }
+        args.push(current);
+        args
     }
 
     #[test]
@@ -427,7 +754,10 @@ mod tests {
             request.launcher,
             PathBuf::from(r"C:\EA Desktop\EALauncher.exe")
         );
-        assert_eq!(request.link, "origin2://game/launch?offerIds=alice2_dd");
+        assert_eq!(
+            request.link.as_deref(),
+            Some("origin2://game/launch?offerIds=alice2_dd")
+        );
         assert_eq!(
             request.game_folder,
             PathBuf::from(r"D:\OriginLibrary\Alice Madness Returns")
@@ -446,6 +776,77 @@ mod tests {
             LaunchAndWait::from_args(&missing_link),
             Some(Err(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_option_survives_the_shortcut() -> eyre::Result<()> {
+        let ea = LaunchAndWait {
+            game_folder: PathBuf::from(r"D:\OriginLibrary\Alice Madness Returns"),
+            restart_launcher: true,
+            close_window: Some("EA".to_string()),
+            cloud_sync: Some(CloudSyncLog {
+                file: PathBuf::from(r"C:\Users\me\AppData\Local\EA\Logs\EADesktop.log"),
+                started: "Cloud Sync entry point post game".to_string(),
+                done: "handleTerminalCloudSyncStatus".to_string(),
+            }),
+            ..alice()
+        };
+        let ubisoft_exe = LaunchAndWait {
+            launcher: PathBuf::from(r"D:\UplayLibrary\Far Cry 3\bin\FC3Updater.exe"),
+            link: None,
+            game_folder: PathBuf::from(r"D:\UplayLibrary\Far Cry 3"),
+            start_in: Some(PathBuf::from(r"D:\UplayLibrary\Far Cry 3")),
+            open_first: Some(OpenFirst {
+                program: PathBuf::from(r"C:\Ubisoft Game Launcher\upc.exe"),
+                window: "Ubisoft Connect".to_string(),
+            }),
+            ..LaunchAndWait::default()
+        };
+        for request in [ea, ubisoft_exe] {
+            let target = request.shortcut_target(Path::new(r"C:\BoilR\BoilR.exe"));
+            let read = LaunchAndWait::from_args(&split(&target.launch_options))
+                .ok_or(eyre::format_err!("no request"))??;
+            assert_eq!(read, request);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_launcher_given_a_link_is_closed() {
+        assert!(alice().launcher_folder().is_some());
+        let explorer = LaunchAndWait {
+            launcher: PathBuf::from(r"C:\Windows\explorer.exe"),
+            ..alice()
+        };
+        assert!(explorer.launcher_folder().is_none());
+        let game_exe = LaunchAndWait {
+            link: None,
+            ..alice()
+        };
+        assert!(game_exe.launcher_folder().is_none());
+    }
+
+    #[test]
+    fn reads_what_the_launcher_logged_since_the_game_started() -> eyre::Result<()> {
+        let file = std::env::temp_dir().join(format!("boilr-sync-log-{}.log", std::process::id()));
+        std::fs::write(&file, "old line: handleTerminalCloudSyncStatus\n")?;
+        let sync = CloudSyncLog {
+            file: file.clone(),
+            started: "post game".to_string(),
+            done: "handleTerminalCloudSyncStatus".to_string(),
+        };
+        let start = sync.length();
+        assert_eq!(sync.written_since(start), "");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)?
+            .write_all(b"post game sync\n")?;
+        assert_eq!(sync.written_since(start), "post game sync\n");
+        // The launcher started a new, shorter log.
+        std::fs::write(&file, "new\n")?;
+        assert_eq!(sync.written_since(start), "new\n");
+        std::fs::remove_file(&file)?;
         Ok(())
     }
 

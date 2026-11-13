@@ -18,7 +18,7 @@ pub(crate) struct UbisoftGame {
     /// running, so Steam would otherwise count the game as running until Ubisoft Connect
     /// closes, or (when it was already open) as stopped at once.
     pub(crate) helper: Option<PathBuf>,
-    /// Close Ubisoft Connect before and after the game, so Steam starts it and its overlay
+    /// Close an open Ubisoft Connect before the game too, so Steam starts it and its overlay
     /// reaches the game ([`super::settings::UbisoftSettings::steam_overlay`]).
     pub(crate) restart_launcher: bool,
 }
@@ -31,11 +31,14 @@ impl From<UbisoftGame> for ShortcutOwned {
             &game.game_folder,
             &game.launcher_compat_folder,
         ) {
+            // Ubisoft Connect can't be asked to quit (a close request only hides it), so a
+            // Ubisoft Connect this launch started is ended after the game.
             let target = LaunchAndWait {
                 launcher: game.launcher.clone(),
-                link,
+                link: Some(link),
                 game_folder: game_folder.clone(),
                 restart_launcher: game.restart_launcher,
+                ..LaunchAndWait::default()
             }
             .shortcut_target(helper);
             return Shortcut::new(

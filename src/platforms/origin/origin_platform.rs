@@ -51,6 +51,14 @@ impl EAPlatform {
         #[cfg(windows)]
         let link_handler = super::installer_data::link_handler(&ea_folders.exe_path);
         #[cfg(windows)]
+        let ea_app_log = std::env::var("LOCALAPPDATA").ok().map(|local| {
+            Path::new(&local)
+                .join("Electronic Arts")
+                .join("EA Desktop")
+                .join("Logs")
+                .join("EADesktop.log")
+        });
+        #[cfg(windows)]
         for found in super::installer_data::installed_games() {
             let known = games.iter().any(|game| {
                 let ids = manifest_ids(&game.id);
@@ -65,6 +73,8 @@ impl EAPlatform {
                     found_by: FoundBy::InstallerData,
                     game_folder: Some(found.folder),
                     helper: boilr_core::launch_and_wait::helper(),
+                    restart_launcher: self.settings.steam_overlay,
+                    ea_app_log: ea_app_log.clone(),
                 });
             }
         }
@@ -95,6 +105,8 @@ fn manifest_games(content_folder: &Path, ea_folders: &EAPathData) -> eyre::Resul
                 found_by: FoundBy::Manifest,
                 game_folder: None,
                 helper: None,
+                restart_launcher: false,
+                ea_app_log: None,
             })
         });
     Ok(games.collect())
@@ -274,6 +286,11 @@ impl GamesPlatform for EAPlatform {
     fn render_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Origin/EA Desktop");
         ui.checkbox(&mut self.settings.enabled, "Import from Origin/EA Desktop");
+        #[cfg(windows)]
+        ui.checkbox(
+            &mut self.settings.steam_overlay,
+            "Steam overlay also when the EA app is open: close it before each game",
+        );
     }
 
     fn get_settings_serializable(&self) -> String {

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use boilr_core::launch_and_wait::LaunchAndWait;
+use boilr_core::launch_and_wait::{CloudSyncLog, LaunchAndWait};
 use steam_shortcuts_util::{shortcut::ShortcutOwned, Shortcut};
 
 #[derive(Clone)]
@@ -18,7 +18,23 @@ pub struct EAGame {
     /// [`boilr_core::launch_and_wait`]: the launcher exits as soon as it has handed the game
     /// to the EA app, so Steam would otherwise count the game as stopped while it runs.
     pub helper: Option<PathBuf>,
+    /// Close an open EA app before the game too ([`super::EASettings::steam_overlay`]).
+    pub restart_launcher: bool,
+    /// The EA app's log (`EADesktop.log`), which says when its cloud sync after a game is
+    /// done. Without it, BoilR waits a fixed time before closing an EA app it started.
+    pub ea_app_log: Option<PathBuf>,
 }
+
+/// The title of the EA app's window that, asked to close, quits the EA app cleanly (in about
+/// a second). During the cloud sync after a game it asks the user to wait or skip the sync
+/// instead, and while a game runs it asks to close the game first.
+const EA_APP_WINDOW: &str = "EA";
+/// In the EA app's log line when it starts the cloud sync after a game.
+const SYNC_STARTED: &str = "Cloud Sync entry point post game";
+/// In the EA app's log line when that sync has ended, successfully or not
+/// (`ProcessCoordinator::handleTerminalCloudSyncStatus`, "Post game cloud sync completed
+/// successfully").
+const SYNC_DONE: &str = "handleTerminalCloudSyncStatus";
 
 /// Where BoilR found an installed EA game, which decides what its id is and how it starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,16 +74,6 @@ fn make_launch_url(id: &str, launcher_location: &std::path::Path) -> String {
     }
 }
 
-/// `explorer.exe`, which hands a link to the Explorer that is already running. The EA app
-/// that starts the game, when it is not running yet, then starts outside Steam's process
-/// tree: inside it, the EA app cannot start games ("Create Process: Access is denied" in
-/// its log, launch error 9). Opening the link with `EALauncher.exe` directly from Steam
-/// fails that way whenever the EA app is closed.
-fn shell_opener() -> PathBuf {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    PathBuf::from(root).join("explorer.exe")
-}
-
 impl From<EAGame> for ShortcutOwned {
     fn from(game: EAGame) -> Self {
         let url = launch_url(&game);
@@ -77,11 +83,21 @@ impl From<EAGame> for ShortcutOwned {
             &game.launcher_compat_folder,
         ) {
             (Some(helper), Some(game_folder), None) => {
+                // EALauncher.exe hands the link to an open EA app, or starts the EA app
+                // inside Steam's tree, where the game gets Steam's overlay. BoilR then closes
+                // the EA app after the game and its cloud sync.
                 let target = LaunchAndWait {
-                    launcher: shell_opener(),
-                    link: url,
+                    launcher: game.launcher_location.clone(),
+                    link: Some(url),
                     game_folder: game_folder.clone(),
-                    restart_launcher: false,
+                    restart_launcher: game.restart_launcher,
+                    close_window: Some(EA_APP_WINDOW.to_string()),
+                    cloud_sync: game.ea_app_log.as_ref().map(|file| CloudSyncLog {
+                        file: file.clone(),
+                        started: SYNC_STARTED.to_string(),
+                        done: SYNC_DONE.to_string(),
+                    }),
+                    ..LaunchAndWait::default()
                 }
                 .shortcut_target(helper);
                 (target.exe, target.start_dir, target.launch_options)
@@ -142,6 +158,8 @@ mod tests {
             found_by: FoundBy::InstallerData,
             game_folder: None,
             helper: None,
+            restart_launcher: false,
+            ea_app_log: None,
         };
         let shortcut: ShortcutOwned = game.into();
         assert_eq!(shortcut.exe, "\"C:\\EA Desktop\\EALauncher.exe\"");
@@ -165,15 +183,21 @@ mod tests {
             found_by: FoundBy::InstallerData,
             game_folder: Some(PathBuf::from(r"D:\Games\Alice Madness Returns\")),
             helper: Some(PathBuf::from(r"C:\BoilR\BoilR.exe")),
+            restart_launcher: false,
+            ea_app_log: Some(PathBuf::from(r"C:\EA\Logs\EADesktop.log")),
         };
-        let shortcut: ShortcutOwned = game.into();
+        let shortcut: ShortcutOwned = game.clone().into();
         assert_eq!(shortcut.exe, r#""C:\BoilR\BoilR.exe""#);
-        assert!(shortcut.launch_options.starts_with(
-            r#"--launch-and-wait --game-folder "D:\Games\Alice Madness Returns" --launcher ""#
-        ));
-        // The link goes through Explorer, so a closed EA app starts outside Steam.
-        assert!(shortcut
-            .launch_options
-            .ends_with(r#"explorer.exe" --link "origin2://game/launch?offerIds=alice2_dd""#));
+        assert_eq!(
+            shortcut.launch_options,
+            r#"--launch-and-wait --game-folder "D:\Games\Alice Madness Returns" --launcher "C:\EA Desktop\EALauncher.exe" --link "origin2://game/launch?offerIds=alice2_dd" --close-window "EA" --sync-log "C:\EA\Logs\EADesktop.log" --sync-started "Cloud Sync entry point post game" --sync-done "handleTerminalCloudSyncStatus""#
+        );
+
+        let restart = EAGame {
+            restart_launcher: true,
+            ..game
+        };
+        let shortcut: ShortcutOwned = restart.into();
+        assert!(shortcut.launch_options.ends_with(" --restart-launcher"));
     }
 }

@@ -211,6 +211,7 @@ dependencies = [
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "wayland-cursor",
+ "windows-sys 0.61.2",
  "winreg 0.56.0",
  "winres",
 ]
@@ -235,6 +236,7 @@ dependencies = [
  "time",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

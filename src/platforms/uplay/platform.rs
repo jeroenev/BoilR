@@ -313,7 +313,7 @@ impl GamesPlatform for UbisoftPlatform {
         #[cfg(windows)]
         ui.checkbox(
             &mut self.settings.steam_overlay,
-            "Steam overlay: close Ubisoft Connect before and after each game, so Steam starts it",
+            "Steam overlay also when Ubisoft Connect is open: close it before each game",
         );
     }
 
