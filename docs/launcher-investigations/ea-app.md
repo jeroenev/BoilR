@@ -19,7 +19,7 @@ where the logs are.
 | Game starts from Steam, EA app open or closed | Works (shipped: BoilR wait helper, link through `explorer.exe`) |
 | Steam shows the game as running, returns to Play after it | Works (shipped wait helper) |
 | Steam overlay in the game | **Works when Steam starts the EA app** (EA app closed beforehand: R2, R5); not with the shipped `explorer.exe` route, which keeps the EA app outside Steam's tree |
-| Big Picture "Resume game" | Not with the shipped route; untested with the EA app inside Steam's tree (needs a controller) |
+| Big Picture "Resume game" | Not with the shipped route; **works** with TEST EA7 (user, 2026-11-13, [results](user-tests.md#results-2026-11-13)) |
 
 The catch of the in-tree route: the EA app then stays in Steam's tree after the game, so Steam
 shows the game as running until the EA app is quit (as Ubisoft Connect, see that report). The
@@ -131,10 +131,9 @@ ending the processes.
 
 ## Still open
 
-- Controller checks on the in-tree route (TEST EA7): Home button, Big Picture "Resume game",
-  the shortcut's controller layout.
-- Pressing Play inside an EA app that Steam started (TEST EA6). R4 suggests the game is then
-  not tracked although the overlay DLL is in it.
+- Controller checks on TEST EA7 and TEST EA6 passed (user, 2026-11-13: Home overlay, Resume,
+  Play again). Still odd: Steam's Stop on TEST EA7 hangs about a minute before the game
+  closes, and one F12 screenshot failed with the EA app open beforehand.
 - How long a real cloud upload takes (play, let the game save, quit; R16).
 - Only one EA game (Alice) was tried. Newer EA games (EA anticheat, Denuvo, their own
   launchers such as the Sims 4 or Battlefield ones) may hand over to other programs or run

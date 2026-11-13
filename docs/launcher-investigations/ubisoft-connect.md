@@ -126,11 +126,12 @@ Without decryption, `UbisoftGameLauncher.exe`'s command line carries `-upc_exe_p
 
 ## Still open
 
-- Controller checks for the direct exe (TEST UB1, UB4): Home button, "Resume game", the
-  shortcut's controller layout.
-- AC IV after entering the password; Far Cry 4 once its installers stop asking for admin
-  rights (is the game then logged as tracked?); Watch_Dogs and AC Origins after "Locate
-  installed game".
+- Controller checks (user, 2026-11-13, [results](user-tests.md#results-2026-11-13)): the
+  direct exe works fully for Far Cry 3, Far Cry 4 and AC IV **when Ubisoft Connect is already
+  running**. With Ubisoft Connect closed, Far Cry 3's overlay flashes and disappears (Resume
+  and status fine). Idea: start Ubisoft Connect through `explorer.exe` first, then the exe.
+- Far Cry 4's admin prompt came only once. Watch_Dogs and AC Origins after "Locate
+  installed game" are untested.
 - Games where the direct exe doesn't work: Ubisoft+ titles, games with Denuvo or anti-cheat,
   games whose exe is a separate launcher.
 - A real cloud-save signal: rerun U8 after saving in the game.

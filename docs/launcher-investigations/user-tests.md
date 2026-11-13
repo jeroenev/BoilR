@@ -1,5 +1,33 @@
 # Tests that need a person (2026-11-11)
 
+## Results (2026-11-13)
+
+Filled in by the user with a controller, Steam started normally.
+
+| Test | Result |
+|---|---|
+| 1a TEST EA7, EA app closed | **All yes:** Home opens the overlay, Resume works, controller works, F12 screenshot, Play again within ~20 s and the EA app gone. |
+| 1b TEST EA7, EA app open | All yes (signed in again without a prompt), **except F12: no screenshot** (once; not retried). |
+| 2 TEST EA6 (Play pressed in an EA app that Steam started) | **Works:** game starts, Home opens the overlay, Steam shows running until the EA app is exited (expected). Unlike EA R4, where the game was asked for with a link from outside. |
+| 3 Stop, shipped Alice shortcut | The game keeps running (expected). |
+| 3 Stop, TEST EA7 | Ends the game, but only after **about a minute** of hanging. |
+| 4a TEST UB1 FC3 exe, Ubisoft Connect closed | Resume, controller, quit → Play all fine, but **Home: the overlay flashes for a second and disappears** (sounds play, no usable UI). |
+| 4b Same, Ubisoft Connect open | **All yes.** |
+| 5 Far Cry 4, AC IV through their exe | **All yes.** The admin prompt (prerequisites) came once; gone on the second launch. AC IV needed the password once. |
+| 6 TEST EA3 Resume prototype | **Doesn't work:** overlay sounds but nothing appears; Resume doesn't bring the game back. |
+| 6 TEST EA4 Overlay window prototype | **Unreliable:** the overlay sometimes appears; it works with the controller, but the game's controller input is broken afterwards (focus not given back). |
+| 7 Cloud saves, optional tests | Not done. |
+
+Conclusions:
+
+- **EA:** `EALauncher.exe` + `--restart-launcher` is the way (tracking, overlay, Resume, Play
+  again). Open: the minute-long Stop, and the one missed F12 screenshot.
+- **Ubisoft:** the game's own exe works when Ubisoft Connect is already running; when the game
+  has to start Ubisoft Connect itself, the overlay breaks (likely Ubisoft Connect's window or
+  its own overlay taking over as it starts). A helper could start Ubisoft Connect through
+  `explorer.exe` first, wait until it is up, then start the exe. Untested.
+- **Prototypes:** dropped; the in-tree routes make them unnecessary.
+
 What the agents couldn't check themselves: the controller's Home button, Big Picture's
 "Resume game", the controller layout, UAC prompts, passwords, and real save games. Every
 shortcut below is in Steam on the test machine (account folder `userdata\<id>`); start
