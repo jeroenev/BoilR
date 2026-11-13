@@ -159,7 +159,9 @@ runs, and the EA app waits out that timeout. Not confirmed.
 - Controller checks on TEST EA7 and TEST EA6 passed (user, 2026-11-13: Home overlay, Resume,
   Play again). Still odd: Steam's Stop on TEST EA7 hangs about a minute before the game
   closes (see round 5 for a likely cause), and one F12 screenshot failed with the EA app open
-  beforehand. TEST EA8 still needs the controller checks (see [user tests](user-tests.md)).
+  beforehand. TEST EA8 passed the controller checks (user, round 5: Home overlay, Resume, Play
+  again after ~7 s; with the EA app open no overlay, as expected), and a real save (14:36)
+  synced before BoilR closed the EA app, without a dialog.
 - How long a real cloud upload takes (play, let the game save, quit; R16).
 - Only one EA game (Alice) was tried. Newer EA games (EA anticheat, Denuvo, their own
   launchers such as the Sims 4 or Battlefield ones) may hand over to other programs or run

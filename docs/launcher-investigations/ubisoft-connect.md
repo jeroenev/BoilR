@@ -196,7 +196,34 @@ Earlier notes, before the analysis:
 - Only a test with a real save can tell: play, save, quit, close Ubisoft Connect cleanly, and
   check on another computer (or after clearing the local save) whether the save arrived.
 
+## Round 7: starting the game's own program too early (2026-11-13)
+
+The user's R5-3 (TEST UB8, Ubisoft Connect closed) failed with Ubisoft Connect asking to
+restart and sign in again. Its log for both runs: Ubisoft Connect started, its window
+appeared within a second, BoilR started the game 3 s later, and the game connected **at the
+same second as** `AccountStartupUser.cpp (238) User: <id>` (signed in), as `product id 0`.
+20–30 s later: `Demux will be closed due to 12`, `Ownership connection is not set up (11-5002)`,
+`Shell recovery page ... {"retryOwnershipInit"...}`. The agent's U10 had worked by timing:
+there the game connected one second after the sign-in line. Normally the account's ownership
+data loads 1–2 s after that line (`OwnershipSaveToCache.cpp ... Could not read ownership
+cache`).
+
+Fix: `--open-first` now waits for a line in the launcher's log (`--open-first-log
+<launcher>\logs\launcher_log.txt --open-first-ready "AccountStartupUser.cpp"`, up to 5 minutes,
+so a sign-in by the user fits), then 5 s more, instead of waiting for the window.
+
+| # | What | UC before | Result |
+|---|---|---|---|
+| U16 | TEST UB12 (Far Cry 3's own program, new arguments), 2 runs | closed | `the launcher was ready after 7.0s`; game started 5 s later and connected as `product id 46`; no ownership error, no recovery page. Overlay DLL and overlay UI attached; the user saw the overlay work (main menu). Steam back to Play ~8 s after the game; Ubisoft Connect stays open. |
+
 ## Still open
+
+- **Far Cry 3 in-game:** the Steam overlay works in the main menu and breaks once a level is
+  loaded (once not shown, once the game crashed; user, TEST UB11, which starts Ubisoft
+  Connect inside Steam's tree). Earlier Far Cry 3 checks were all made in the main menu, so
+  every route may have it. Far Cry 3 also loads Ubisoft's own overlay (`overlay.dll`) next to
+  Steam's. Next test: turn off Ubisoft Connect's in-game overlay (Settings, General) and try
+  in a level again; and check Far Cry 4 and AC IV in a level.
 
 - Controller checks (user, 2026-11-13, [results](user-tests.md#results-2026-11-13)): the
   direct exe works fully for Far Cry 3, Far Cry 4 and AC IV **when Ubisoft Connect is already

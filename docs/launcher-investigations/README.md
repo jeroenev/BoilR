@@ -150,8 +150,9 @@ Branch `launch-and-wait` (on top of `ea-app-installed-games`), as of round 5 (20
   running until it was quit (U2b).
 - **Ubisoft, the game's own program** (setting `start_game_exe`): `--launcher "<game exe>"`
   without a link, `--start-in`, and `--open-first upc.exe`: when Ubisoft Connect isn't
-  running, BoilR opens it through Explorer (outside Steam) and waits for its window, then
-  starts the game. Ubisoft Connect is never closed; Play again ~7 s after the game. The exe
+  running, BoilR opens it through Explorer (outside Steam), waits until its log says it has
+  signed in (`--open-first-log`, `--open-first-ready`) plus 5 s, then starts the game
+  (round 7: a game started earlier makes Ubisoft Connect ask to sign in again). Ubisoft Connect is never closed; Play again ~7 s after the game. The exe
   comes from Ubisoft Connect's encrypted catalogue (`src/platforms/uplay/catalogue.rs`, see
   [Exe paths](ubisoft-connect.md#exe-paths)); games without one, or whose program needs
   arguments, keep the link.

@@ -1,5 +1,20 @@
 # Tests that need a person (2026-11-11)
 
+## Round 5 results (2026-11-13)
+
+Filled in by the user. Overlay checks were mostly done in the games' main menus (see the Far
+Cry 3 note).
+
+| Test | Result |
+|---|---|
+| R5-1 TEST EA8, EA app closed | **All yes:** Home overlay, Resume, Play again after ~7 s. |
+| R5-2 TEST EA8, EA app open | Game starts, Play again within 10 s. No overlay, as expected: an open EA app takes the game over outside Steam (use the EA setting `steam_overlay` to get it here too). |
+| R5-3 TEST UB8, Ubisoft Connect closed | **Failed:** Ubisoft Connect showed an error asking to restart and sign in again; with Ubisoft Connect already open the game and overlay worked. Cause: BoilR started the game as soon as Ubisoft Connect's window appeared, before it had signed in (see [Ubisoft round 7](ubisoft-connect.md#round-7-starting-the-games-own-program-too-early-2026-11-13)). Fixed; TEST UB12 got the overlay (main menu, user). Resume and Play again were fine. |
+| R5-4 TEST UB11 (Ubisoft default, clean quit) | **All yes:** Home overlay, Play again within ~30 s with Ubisoft Connect gone, its X button still hides it afterwards. |
+| R5-5 cloud saves | **Alice (TEST EA8):** saved at 14:36, Play came back, EA app closed without a dialog. **Far Cry 3 (TEST UB11):** saved at 14:39; Ubisoft Connect's UI showed the save uploaded within 2 s of closing the game, no conflict at the next start. So BoilR's 15 s wait covered it. |
+| Far Cry 3 in-game | **The Steam overlay works in the main menu but breaks once a level is loaded:** once it didn't show, once the game crashed (TEST UB11; the user notes earlier Far Cry 3 tests were also done in the main menu only). Open. |
+| R5-6 real shortcuts | Not done. |
+
 ## Round 5: the implemented routes (2026-11-13)
 
 BoilR now closes a launcher it started itself after the game (EA: after the EA app's cloud
@@ -18,7 +33,8 @@ preparation as below; quit games from their own menu.
 - [ ] The game starts. (Home: no overlay is expected here.)
 - [ ] Quit: Play within ~10 s; the EA app stays open.
 
-**R5-3. TEST UB8 FC3 own program** (11972220418510553088), Ubisoft Connect closed. This is
+**R5-3. TEST UB12 FC3 own program ready** (9806332779812618240; replaces TEST UB8, whose
+arguments no longer exist), Ubisoft Connect closed. This is
 the case where the overlay flashed and disappeared (4a); now BoilR opens Ubisoft Connect first.
 - [ ] Home opens the Steam overlay, and it stays usable.
 - [ ] "Resume game" returns to the game.
