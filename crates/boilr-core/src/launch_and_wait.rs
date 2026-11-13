@@ -46,6 +46,9 @@ const SYNC_STARTED: &str = "--sync-started";
 const SYNC_DONE: &str = "--sync-done";
 const OPEN_FIRST: &str = "--open-first";
 const OPEN_FIRST_WINDOW: &str = "--open-first-window";
+const SETTING_FILE: &str = "--setting-file";
+const SETTING_FROM: &str = "--setting-from";
+const SETTING_TO: &str = "--setting-to";
 
 /// How long the launcher gets to start the game: it may log in or update the game first.
 const START_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -114,6 +117,22 @@ pub struct LaunchAndWait {
     pub cloud_sync: Option<CloudSyncLog>,
     /// A launcher to open, outside Steam's tree, before the game's own program starts.
     pub open_first: Option<OpenFirst>,
+    /// A line of the launcher's settings to change while this launch has the launcher
+    /// running, so that [`Self::close_window`] quits it (Ubisoft Connect only hides itself
+    /// by default).
+    pub setting: Option<SettingLine>,
+}
+
+/// A line in a launcher's settings file that BoilR changes before it starts the launcher,
+/// and changes back once the launcher has exited. Only while the launcher is closed: it
+/// writes its settings back when it exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingLine {
+    pub file: PathBuf,
+    /// The line as the launcher has it by default (`closebehavior: CloseBehavior_Minimize`).
+    pub from: String,
+    /// The line while BoilR has the launcher running (`closebehavior: CloseBehavior_Close`).
+    pub to: String,
 }
 
 /// Where a launcher logs its cloud sync after a game.
@@ -175,6 +194,11 @@ impl LaunchAndWait {
             add(OPEN_FIRST, path(&first.program));
             add(OPEN_FIRST_WINDOW, quoted(&first.window));
         }
+        if let Some(setting) = &self.setting {
+            add(SETTING_FILE, path(&setting.file));
+            add(SETTING_FROM, quoted(&setting.from));
+            add(SETTING_TO, quoted(&setting.to));
+        }
         if self.restart_launcher {
             options.push(RESTART_LAUNCHER.to_string());
         }
@@ -224,6 +248,14 @@ impl LaunchAndWait {
                 }),
                 None => None,
             };
+            let setting = match optional(SETTING_FILE)? {
+                Some(file) => Some(SettingLine {
+                    file: PathBuf::from(file),
+                    from: required(SETTING_FROM)?,
+                    to: required(SETTING_TO)?,
+                }),
+                None => None,
+            };
             Ok(LaunchAndWait {
                 launcher: PathBuf::from(required(LAUNCHER)?),
                 link: optional(LINK)?,
@@ -233,6 +265,7 @@ impl LaunchAndWait {
                 close_window: optional(CLOSE_WINDOW)?,
                 cloud_sync,
                 open_first,
+                setting,
             })
         })())
     }
@@ -265,6 +298,8 @@ impl LaunchAndWait {
         // Whether this launch starts the launcher, inside Steam's tree. Then it is closed
         // after the game, or Steam would count the game as running until it closes.
         let mut starts_launcher = false;
+        // Whether this launch changed the launcher's setting line, to change back.
+        let mut changed_setting = false;
         let mut sync_log_start = 0;
         if processes.any_in(&game_folder) {
             log.line("the game is already running; waiting for it");
@@ -272,9 +307,14 @@ impl LaunchAndWait {
             if let Some(folder) = &launcher_folder {
                 let was_running = processes.count_directly_in(folder) > 0;
                 if was_running && self.restart_launcher {
-                    self.close_launcher(folder, &mut processes, &mut log);
+                    // Its setting can't be changed while it runs: no close request.
+                    let ask = self.setting.is_none();
+                    self.close_launcher(folder, ask, &mut processes, &mut log);
                 }
                 starts_launcher = !was_running || self.restart_launcher;
+                if let (true, Some(setting)) = (starts_launcher, &self.setting) {
+                    changed_setting = setting.change(&mut log);
+                }
                 log.line(if starts_launcher {
                     "this launch starts the launcher; it is closed after the game"
                 } else {
@@ -324,7 +364,19 @@ impl LaunchAndWait {
             if processes.any_in(&game_folder) {
                 log.line("the game started again; leaving the launcher open");
             } else {
-                self.close_launcher(folder, &mut processes, &mut log);
+                let ask = self.setting.is_none() || changed_setting;
+                self.close_launcher(folder, ask, &mut processes, &mut log);
+            }
+        }
+        if let (true, Some(setting)) = (changed_setting, &self.setting) {
+            // Only once the launcher is gone: it writes its settings back when it exits.
+            let gone = launcher_folder
+                .as_ref()
+                .is_none_or(|folder| processes.count_directly_in(folder) == 0);
+            if gone {
+                setting.change_back(&mut log);
+            } else {
+                log.line("the launcher still runs; its setting stays changed");
             }
         }
         Ok(())
@@ -361,12 +413,12 @@ impl LaunchAndWait {
 
     /// Closes the programs in the launcher's own folder (not in folders below it, where
     /// games can be installed), and waits for them to go: first by asking its window to
-    /// close, then by ending them.
-    fn close_launcher(&self, folder: &Folder, processes: &mut Processes, log: &mut Log) {
+    /// close (when `ask`), then by ending them.
+    fn close_launcher(&self, folder: &Folder, ask: bool, processes: &mut Processes, log: &mut Log) {
         if processes.count_directly_in(folder) == 0 {
             return;
         }
-        if let Some(title) = &self.close_window {
+        if let (true, Some(title)) = (ask, &self.close_window) {
             let asked = ask_windows_to_close(&processes.pids_directly_in(folder), title);
             if asked > 0 {
                 log.line("asking the launcher to close");
@@ -392,6 +444,53 @@ impl LaunchAndWait {
             processes.kill_directly_in(folder);
         }
     }
+}
+
+impl SettingLine {
+    /// Changes [`Self::from`] to [`Self::to`] when the file has that line exactly once;
+    /// whether it did.
+    fn change(&self, log: &mut Log) -> bool {
+        let changed = replace_line(&self.file, &self.from, &self.to);
+        log.line(if changed {
+            "changed the launcher's setting for this launch"
+        } else {
+            "the launcher's setting is not the expected default; left as it is"
+        });
+        changed
+    }
+
+    fn change_back(&self, log: &mut Log) {
+        if replace_line(&self.file, &self.to, &self.from) {
+            log.line("changed the launcher's setting back");
+        } else {
+            log.line("could not change the launcher's setting back");
+        }
+    }
+}
+
+/// Replaces the one line of `file` that is `from` (ignoring indentation and line endings)
+/// with `to`, keeping its indentation. False when there is no such line, or more than one.
+fn replace_line(file: &Path, from: &str, to: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    if text.lines().filter(|line| line.trim() == from).count() != 1 {
+        return false;
+    }
+    let changed: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.trim() != from {
+                return line.to_string();
+            }
+            let indent = line
+                .get(..line.len() - line.trim_start().len())
+                .unwrap_or_default();
+            let ending = line.get(line.trim_end().len()..).unwrap_or_default();
+            format!("{indent}{to}{ending}")
+        })
+        .collect();
+    std::fs::write(file, changed).is_ok()
 }
 
 impl CloudSyncLog {
@@ -809,6 +908,30 @@ mod tests {
                 .ok_or(eyre::format_err!("no request"))??;
             assert_eq!(read, request);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn changes_one_setting_line_and_back() -> eyre::Result<()> {
+        let file = std::env::temp_dir().join(format!("boilr-setting-{}.yaml", std::process::id()));
+        let original = "misc:\r\n  closebehavior: CloseBehavior_Minimize\r\n  other: 1\r\n";
+        std::fs::write(&file, original)?;
+        let setting = SettingLine {
+            file: file.clone(),
+            from: "closebehavior: CloseBehavior_Minimize".to_string(),
+            to: "closebehavior: CloseBehavior_Close".to_string(),
+        };
+        let mut log = Log { file: None };
+        assert!(setting.change(&mut log));
+        assert_eq!(
+            std::fs::read_to_string(&file)?,
+            "misc:\r\n  closebehavior: CloseBehavior_Close\r\n  other: 1\r\n"
+        );
+        // Already changed: not the expected default, left alone.
+        assert!(!setting.change(&mut log));
+        setting.change_back(&mut log);
+        assert_eq!(std::fs::read_to_string(&file)?, original);
+        std::fs::remove_file(&file)?;
         Ok(())
     }
 

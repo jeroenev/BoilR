@@ -6,10 +6,15 @@ pub struct UbisoftSettings {
     /// Windows: close an open Ubisoft Connect before each game, so the game's shortcut starts
     /// it inside Steam and Steam's overlay (and Big Picture's Resume) reaches the game.
     /// Without it, the overlay only reaches games started while Ubisoft Connect is closed; an
-    /// open Ubisoft Connect takes the game over, outside Steam. Off by default: Ubisoft
-    /// Connect can only be ended, which stops its downloads, cuts off a cloud-save upload
-    /// that takes longer than the wait after the game, and leaves another Ubisoft game
-    /// running at the time without its launcher.
+    /// open Ubisoft Connect takes the game over, outside Steam. Off by default: an open
+    /// Ubisoft Connect can only be ended (it hides itself when asked to close), which stops
+    /// its downloads and leaves another Ubisoft game running at the time without its
+    /// launcher.
+    ///
+    /// Either way, a Ubisoft Connect that a game's shortcut started is asked to quit 15
+    /// seconds after the game (its `closebehavior` is set to quit for that while), and ended
+    /// if it doesn't. Its quit doesn't wait for cloud-save uploads; a cut-off upload is
+    /// probably retried when that game next starts.
     #[serde(default)]
     pub steam_overlay: bool,
     /// Windows: let Steam start the game's own program, found in Ubisoft Connect's game

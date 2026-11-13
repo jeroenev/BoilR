@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use boilr_core::launch_and_wait::{LaunchAndWait, OpenFirst};
+use boilr_core::launch_and_wait::{LaunchAndWait, OpenFirst, SettingLine};
 use steam_shortcuts_util::shortcut::{Shortcut, ShortcutOwned};
 
 #[derive(Clone)]
@@ -24,10 +24,18 @@ pub(crate) struct UbisoftGame {
     /// The game's own program, for Steam to start instead of the link
     /// ([`super::settings::UbisoftSettings::start_game_exe`]).
     pub(crate) program: Option<super::catalogue::GameProgram>,
+    /// Ubisoft Connect's `settings.yaml`, whose `closebehavior` BoilR changes while it has
+    /// Ubisoft Connect running, so that a close request quits it instead of hiding it.
+    pub(crate) settings_file: Option<PathBuf>,
 }
 
-/// The title of Ubisoft Connect's window, which shows it is up.
+/// The title of Ubisoft Connect's window: it shows Ubisoft Connect is up, and a close request
+/// to it quits Ubisoft Connect while `closebehavior` is [`CLOSE_QUITS`].
 const UBISOFT_CONNECT_WINDOW: &str = "Ubisoft Connect";
+/// Ubisoft Connect's default: its window's close button hides it in the tray.
+const CLOSE_HIDES: &str = "closebehavior: CloseBehavior_Minimize";
+/// The setting under which closing its window quits Ubisoft Connect.
+const CLOSE_QUITS: &str = "closebehavior: CloseBehavior_Close";
 
 impl From<UbisoftGame> for ShortcutOwned {
     fn from(game: UbisoftGame) -> Self {
@@ -50,13 +58,21 @@ impl From<UbisoftGame> for ShortcutOwned {
                     }),
                     ..LaunchAndWait::default()
                 },
-                // Ubisoft Connect can't be asked to quit (a close request only hides it), so
-                // a Ubisoft Connect this launch started is ended after the game.
+                // A Ubisoft Connect this launch started is asked to quit after the game: a
+                // close request quits it while `closebehavior` says so, which BoilR sets
+                // while Ubisoft Connect is closed and sets back once it has exited. It logs
+                // no end of its cloud sync, so BoilR waits a fixed time first.
                 None => LaunchAndWait {
                     launcher: game.launcher.clone(),
                     link: Some(link),
                     game_folder: game_folder.clone(),
                     restart_launcher: game.restart_launcher,
+                    close_window: Some(UBISOFT_CONNECT_WINDOW.to_string()),
+                    setting: game.settings_file.as_ref().map(|file| SettingLine {
+                        file: file.clone(),
+                        from: CLOSE_HIDES.to_string(),
+                        to: CLOSE_QUITS.to_string(),
+                    }),
                     ..LaunchAndWait::default()
                 },
             };
@@ -105,6 +121,9 @@ mod tests {
             helper: Some(PathBuf::from(r"C:\BoilR\BoilR.exe")),
             restart_launcher: true,
             program: None,
+            settings_file: Some(PathBuf::from(
+                r"C:\Users\me\Ubisoft Game Launcher\settings.yaml",
+            )),
         }
     }
 
@@ -114,7 +133,7 @@ mod tests {
         assert_eq!(shortcut.exe, r#""C:\BoilR\BoilR.exe""#);
         assert_eq!(
             shortcut.launch_options,
-            r#"--launch-and-wait --game-folder "D:\UplayLibrary\Far Cry 3" --launcher "C:\Ubisoft Game Launcher\upc.exe" --link "uplay://launch/46/0" --restart-launcher"#
+            r#"--launch-and-wait --game-folder "D:\UplayLibrary\Far Cry 3" --launcher "C:\Ubisoft Game Launcher\upc.exe" --link "uplay://launch/46/0" --close-window "Ubisoft Connect" --setting-file "C:\Users\me\Ubisoft Game Launcher\settings.yaml" --setting-from "closebehavior: CloseBehavior_Minimize" --setting-to "closebehavior: CloseBehavior_Close" --restart-launcher"#
         );
     }
 

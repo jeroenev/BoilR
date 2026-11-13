@@ -145,6 +145,13 @@ fn get_games_from_winreg(settings: &UbisoftSettings) -> eyre::Result<Vec<Ubisoft
     }
 
     let helper = boilr_core::launch_and_wait::helper();
+    let settings_file = std::env::var_os("LOCALAPPDATA")
+        .map(|local| {
+            Path::new(&local)
+                .join("Ubisoft Game Launcher")
+                .join("settings.yaml")
+        })
+        .filter(|file| file.is_file());
     let programs = if settings.start_game_exe && helper.is_some() {
         super::catalogue::game_programs()
     } else {
@@ -169,6 +176,7 @@ fn get_games_from_winreg(settings: &UbisoftSettings) -> eyre::Result<Vec<Ubisoft
                     helper: helper.clone(),
                     restart_launcher: settings.steam_overlay,
                     program,
+                    settings_file: settings_file.clone(),
                 })
             }
         }
@@ -214,6 +222,7 @@ fn get_games_from_proton() -> eyre::Result<Vec<UbisoftGame>> {
         helper: None,
         restart_launcher: false,
         program: None,
+        settings_file: None,
     });
     Ok(games.collect())
 }
