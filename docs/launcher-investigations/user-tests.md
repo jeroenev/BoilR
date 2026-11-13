@@ -1,5 +1,33 @@
 # Tests that need a person (2026-11-11)
 
+## Round 8: shorter waits, and the overlay inside a level (2026-11-13)
+
+BoilR asks a Ubisoft Connect it started to quit 5 s after the game (was 15 s). Starting a
+Ubisoft game's own program 1 s after Ubisoft Connect signed in (instead of 5 s) was tried and
+dropped: no error, but no Steam overlay either (user, two runs of TEST UB12). Check the
+overlay **in a loaded level**, not only in the main menu. Ubisoft Connect closed first unless
+a test says otherwise.
+
+**R8-1. TEST UB12 FC3 own program ready** (9806332779812618240).
+- [ ] No Ubisoft Connect error asking to restart or sign in again.
+- [ ] Home opens the Steam overlay in the main menu, and in a loaded level.
+- [ ] Quit: Play again within ~10 s; Ubisoft Connect stays in the tray.
+
+**R8-2. Far Cry 3 without Ubisoft's own overlay.** In Ubisoft Connect: Settings → General →
+turn off the in-game overlay. Then TEST UB12 again, into a level.
+- [ ] Home opens the Steam overlay in a level, and the game doesn't crash.
+- [ ] Turn Ubisoft's in-game overlay back on afterwards.
+
+**R8-3. TEST UB13 FC4 own program ready** (15661960576928579584) and **TEST UB14 AC4 own
+program ready** (14268644813552222208).
+- [ ] Far Cry 4: starts without an error, Home overlay in a level, Play again after quitting.
+- [ ] AC IV: starts without an error, Home overlay in a level, Play again after quitting.
+
+**R8-4. TEST UB11 FC3 helper clean quit** (9960740706689482752): make a save, then quit.
+- [ ] Home opens the Steam overlay in a level.
+- [ ] Play again within ~20 s, Ubisoft Connect gone from the tray.
+- [ ] Next time, Ubisoft Connect shows no save conflict (the upload had 5 s instead of 15).
+
 ## Round 5 results (2026-11-13)
 
 Filled in by the user. Overlay checks were mostly done in the games' main menus (see the Far

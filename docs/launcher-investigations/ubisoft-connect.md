@@ -216,6 +216,16 @@ so a sign-in by the user fits), then 5 s more, instead of waiting for the window
 |---|---|---|---|
 | U16 | TEST UB12 (Far Cry 3's own program, new arguments), 2 runs | closed | `the launcher was ready after 7.0s`; game started 5 s later and connected as `product id 46`; no ownership error, no recovery page. Overlay DLL and overlay UI attached; the user saw the overlay work (main menu). Steam back to Play ~8 s after the game; Ubisoft Connect stays open. |
 
+## Round 8: shorter waits (2026-11-13)
+
+Tried, at the user's request: start the game's own program 1 s after the sign-in line
+instead of 5 s, and close a Ubisoft Connect BoilR started 5 s after the game instead of 15 s.
+
+| # | What | UC before | Result |
+|---|---|---|---|
+| U17 | TEST UB12 with 1 s after sign-in, 3 runs | closed | Runs 1 and 2: game connected as `product id 46` right after ownership loaded, no error, Steam's overlay DLL in the game, **but the user saw no overlay**. Run 3: the game connected as `product id 0` at the same second as ownership loaded (the pattern of the failed R5-3), and got through by timing. **Dropped: back to 5 s**, which worked for the user in round 7. Ubisoft Connect is evidently still starting up 1 s after signing in, which breaks Steam's overlay without an error (compare user test 4a). |
+| U18 | TEST UB11 with 5 s before the quit | closed | `asking the launcher to close` 5 s after the game, quit after 6 s (`returnCode: 0`), setting back to `CloseBehavior_Minimize`. **Steam back to Play 18.2 s after the game** (was ~28 s). Kept: the user's Far Cry 3 save showed as uploaded within 2 s of the game closing (R5-5). |
+
 ## Still open
 
 - **Far Cry 3 in-game:** the Steam overlay works in the main menu and breaks once a level is
