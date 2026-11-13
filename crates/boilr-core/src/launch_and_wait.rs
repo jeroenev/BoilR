@@ -45,7 +45,8 @@ const SYNC_LOG: &str = "--sync-log";
 const SYNC_STARTED: &str = "--sync-started";
 const SYNC_DONE: &str = "--sync-done";
 const OPEN_FIRST: &str = "--open-first";
-const OPEN_FIRST_WINDOW: &str = "--open-first-window";
+const OPEN_FIRST_LOG: &str = "--open-first-log";
+const OPEN_FIRST_READY: &str = "--open-first-ready";
 const SETTING_FILE: &str = "--setting-file";
 const SETTING_FROM: &str = "--setting-from";
 const SETTING_TO: &str = "--setting-to";
@@ -65,10 +66,12 @@ const SYNC_START_WAIT: Duration = Duration::from_secs(10);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a launcher that is being closed gets to go away.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long a launcher opened before the game gets to show its window.
-const OPEN_FIRST_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long to give a launcher whose window just appeared before the game starts.
-const OPEN_FIRST_SETTLE: Duration = Duration::from_secs(3);
+/// How long a launcher opened before the game gets to be ready: the user may have to sign in.
+const OPEN_FIRST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How long to give a launcher that says it is ready before the game starts: Ubisoft
+/// Connect loads the account's games a second or two after signing in, and a game that
+/// connects before that gets "Ownership connection is not set up" and a recovery page.
+const OPEN_FIRST_SETTLE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_secs(1);
 
 /// The program shortcuts run in this mode: the BoilR that is importing them, on Windows.
@@ -149,8 +152,11 @@ pub struct CloudSyncLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenFirst {
     pub program: PathBuf,
-    /// The title of the window that shows it is up ("Ubisoft Connect").
-    pub window: String,
+    /// The launcher's log, and text in the line it writes once it is ready (Ubisoft
+    /// Connect's `AccountStartupUser.cpp ... User: <id>`, after signing in). Its window shows
+    /// long before that.
+    pub log: PathBuf,
+    pub ready: String,
 }
 
 /// What a Steam shortcut runs: its `Exe`, `StartDir` and `LaunchOptions`.
@@ -192,7 +198,8 @@ impl LaunchAndWait {
         }
         if let Some(first) = &self.open_first {
             add(OPEN_FIRST, path(&first.program));
-            add(OPEN_FIRST_WINDOW, quoted(&first.window));
+            add(OPEN_FIRST_LOG, path(&first.log));
+            add(OPEN_FIRST_READY, quoted(&first.ready));
         }
         if let Some(setting) = &self.setting {
             add(SETTING_FILE, path(&setting.file));
@@ -244,7 +251,8 @@ impl LaunchAndWait {
             let open_first = match optional(OPEN_FIRST)? {
                 Some(program) => Some(OpenFirst {
                     program: PathBuf::from(program),
-                    window: required(OPEN_FIRST_WINDOW)?,
+                    log: PathBuf::from(required(OPEN_FIRST_LOG)?),
+                    ready: required(OPEN_FIRST_READY)?,
                 }),
                 None => None,
             };
@@ -495,27 +503,35 @@ fn replace_line(file: &Path, from: &str, to: &str) -> bool {
 
 impl CloudSyncLog {
     fn length(&self) -> u64 {
-        std::fs::metadata(&self.file).map_or(0, |meta| meta.len())
+        log_length(&self.file)
     }
 
-    /// What the launcher wrote to its log after `start` bytes. All of it when the log is
-    /// shorter than that: it started over.
     fn written_since(&self, start: u64) -> String {
-        // std opens files shared for reading and writing: the launcher keeps writing to it.
-        let Ok(mut file) = std::fs::File::open(&self.file) else {
-            return String::new();
-        };
-        let start = if self.length() < start { 0 } else { start };
-        let mut bytes = Vec::new();
-        if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err() {
-            return String::new();
-        }
-        String::from_utf8_lossy(&bytes).into_owned()
+        written_since(&self.file, start)
     }
 }
 
+fn log_length(file: &Path) -> u64 {
+    std::fs::metadata(file).map_or(0, |meta| meta.len())
+}
+
+/// What a launcher wrote to its log `file` after `start` bytes. All of it when the log is
+/// shorter than that: it started over.
+fn written_since(file: &Path, start: u64) -> String {
+    // std opens files shared for reading and writing: the launcher keeps writing to it.
+    let Ok(mut opened) = std::fs::File::open(file) else {
+        return String::new();
+    };
+    let start = if log_length(file) < start { 0 } else { start };
+    let mut bytes = Vec::new();
+    if opened.seek(SeekFrom::Start(start)).is_err() || opened.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Opens `first` through Explorer, so it runs outside Steam's tree, unless a program from
-/// its folder already runs, and waits until its window shows.
+/// its folder already runs, and waits until its log says it is ready.
 fn open_first(first: &OpenFirst, processes: &mut Processes, log: &mut Log) -> eyre::Result<()> {
     let Some(folder) = first.program.parent().map(Folder::new) else {
         return Ok(());
@@ -524,6 +540,7 @@ fn open_first(first: &OpenFirst, processes: &mut Processes, log: &mut Log) -> ey
         return Ok(());
     }
     log.line("opening the launcher first");
+    let log_start = log_length(&first.log);
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let mut command = Command::new(Path::new(&root).join("explorer.exe"));
     #[cfg(windows)]
@@ -537,16 +554,16 @@ fn open_first(first: &OpenFirst, processes: &mut Processes, log: &mut Log) -> ey
     let opened = Instant::now();
     while opened.elapsed() < OPEN_FIRST_TIMEOUT {
         sleep(POLL);
-        if has_window(&processes.pids_directly_in(&folder), &first.window) {
+        if written_since(&first.log, log_start).contains(&first.ready) {
             log.line(&format!(
-                "the launcher showed its window after {:?}",
+                "the launcher was ready after {:?}",
                 opened.elapsed()
             ));
             sleep(OPEN_FIRST_SETTLE);
             return Ok(());
         }
     }
-    log.line("the launcher showed no window; starting the game anyway");
+    log.line("the launcher's log never said it was ready; starting the game anyway");
     Ok(())
 }
 
@@ -606,19 +623,9 @@ fn ask_windows_to_close(pids: &[u32], title: &str) -> usize {
     windows.len()
 }
 
-#[cfg(windows)]
-fn has_window(pids: &[u32], title: &str) -> bool {
-    !windows_titled(pids, title).is_empty()
-}
-
 #[cfg(not(windows))]
 fn ask_windows_to_close(_pids: &[u32], _title: &str) -> usize {
     0
-}
-
-#[cfg(not(windows))]
-fn has_window(_pids: &[u32], _title: &str) -> bool {
-    false
 }
 
 /// `value` in double quotes for a Windows command line. Quotes inside are dropped, and so
@@ -898,7 +905,8 @@ mod tests {
             start_in: Some(PathBuf::from(r"D:\UplayLibrary\Far Cry 3")),
             open_first: Some(OpenFirst {
                 program: PathBuf::from(r"C:\Ubisoft Game Launcher\upc.exe"),
-                window: "Ubisoft Connect".to_string(),
+                log: PathBuf::from(r"C:\Ubisoft Game Launcher\logs\launcher_log.txt"),
+                ready: "AccountStartupUser.cpp".to_string(),
             }),
             ..LaunchAndWait::default()
         };

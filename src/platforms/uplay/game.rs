@@ -29,8 +29,21 @@ pub(crate) struct UbisoftGame {
     pub(crate) settings_file: Option<PathBuf>,
 }
 
-/// The title of Ubisoft Connect's window: it shows Ubisoft Connect is up, and a close request
-/// to it quits Ubisoft Connect while `closebehavior` is [`CLOSE_QUITS`].
+/// In Ubisoft Connect's log line once it has signed in (`AccountStartupUser.cpp (238) User:
+/// <id>`). A game started before that gets "Ownership connection is not set up" (11-5002)
+/// and Ubisoft Connect asks to restart and sign in again (user tests, 2026-11-13).
+const UBISOFT_CONNECT_READY: &str = "AccountStartupUser.cpp";
+
+/// Ubisoft Connect's log: `logs\launcher_log.txt` in its install folder.
+fn launcher_log(upc: &Path) -> PathBuf {
+    upc.parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("logs")
+        .join("launcher_log.txt")
+}
+
+/// The title of Ubisoft Connect's window: a close request to it quits Ubisoft Connect while
+/// `closebehavior` is [`CLOSE_QUITS`].
 const UBISOFT_CONNECT_WINDOW: &str = "Ubisoft Connect";
 /// Ubisoft Connect's default: its window's close button hides it in the tray.
 const CLOSE_HIDES: &str = "closebehavior: CloseBehavior_Minimize";
@@ -54,7 +67,8 @@ impl From<UbisoftGame> for ShortcutOwned {
                     start_in: Some(program.working_directory.clone()),
                     open_first: Some(OpenFirst {
                         program: game.launcher.clone(),
-                        window: UBISOFT_CONNECT_WINDOW.to_string(),
+                        log: launcher_log(&game.launcher),
+                        ready: UBISOFT_CONNECT_READY.to_string(),
                     }),
                     ..LaunchAndWait::default()
                 },
@@ -149,7 +163,7 @@ mod tests {
         let shortcut: ShortcutOwned = game.into();
         assert_eq!(
             shortcut.launch_options,
-            r#"--launch-and-wait --game-folder "D:\UplayLibrary\Far Cry 3" --launcher "D:\UplayLibrary\Far Cry 3\bin\FC3Updater.exe" --start-in "D:\UplayLibrary\Far Cry 3" --open-first "C:\Ubisoft Game Launcher\upc.exe" --open-first-window "Ubisoft Connect""#
+            r#"--launch-and-wait --game-folder "D:\UplayLibrary\Far Cry 3" --launcher "D:\UplayLibrary\Far Cry 3\bin\FC3Updater.exe" --start-in "D:\UplayLibrary\Far Cry 3" --open-first "C:\Ubisoft Game Launcher\upc.exe" --open-first-log "C:\Ubisoft Game Launcher\logs\launcher_log.txt" --open-first-ready "AccountStartupUser.cpp""#
         );
     }
 
