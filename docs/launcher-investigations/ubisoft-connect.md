@@ -148,6 +148,29 @@ crates) and finds on this machine: 46 → `bin\FC3Updater.exe` (start in the ins
 Whether opening Ubisoft Connect first fixes the overlay that flashed and vanished in the user
 test (4a) needs the controller's Home button: see [user tests](user-tests.md).
 
+## Round 6: how to close a Ubisoft Connect that BoilR started (2026-11-13)
+
+Round 5 ends a Ubisoft Connect it started, 15 s after the game, without any setting turned on.
+That stops a running download and could cut off an upload. Two alternatives were tested.
+
+| # | What | UC before | Result |
+|---|---|---|---|
+| U13 | (b) Clean quit: `closebehavior: CloseBehavior_Close` set in `settings.yaml` while Ubisoft Connect was closed, TEST UB2 (Steam starts `upc.exe` with the link), game ended, then a close request to the "Ubisoft Connect" windows 5 s later | closed | Overlay as usual. Close request to 3 windows; log `Received shutdown request, reason: 1`, `Received shutdown message (quit), returnCode: 0`; all programs gone **7.5 s** later; **Steam back to Play 12 s after the game** (forced: 24 s). Ubisoft Connect wrote `settings.yaml` back on exit with the changed value, so restoring must happen after it exits. |
+| U14 | (c) TEST UB10: BoilR with `--launcher explorer.exe --link uplay://launch/46/0` | closed | Ubisoft Connect starts outside Steam's tree. **No Steam overlay** (no `gameoverlayrenderer.dll` in the game, Ubisoft's own overlay only). Steam back to Play 7 s after the game; Ubisoft Connect stays open. |
+
+**Does a clean quit wait for cloud saves?** Unknown.
+- Ubisoft Connect logs no sync start or end around a game's exit (`Game process ended`, `Play
+  session ... deleted`, nothing else), and its programs carry no readable shutdown strings
+  (packed).
+- Its save folder (`<launcher>\savegames\<user id>\<game id>\`) still holds an empty
+  `1.save.upload` next to AC IV's `1.save`, both written during the user's AC IV test
+  (08:36). Ubisoft Connect was quit cleanly 42 s after that game (08:38:56, `reason: 1`, the
+  same quit as U13), and has run several times since; the marker stayed. So either the
+  marker doesn't mean "upload pending", or nothing uploaded it, even with a clean quit. It
+  can't serve as a signal to wait for.
+- Only a test with a real save can tell: play, save, quit, close Ubisoft Connect cleanly, and
+  check on another computer (or after clearing the local save) whether the save arrived.
+
 ## Still open
 
 - Controller checks (user, 2026-11-13, [results](user-tests.md#results-2026-11-13)): the
