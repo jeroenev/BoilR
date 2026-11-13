@@ -10,7 +10,7 @@ per-launcher reports hold every scenario that was tried, with what worked and wh
 
 What BoilR does as a result: `boilr_core::launch_and_wait` (the `--launch-and-wait` mode of
 both BoilR binaries), used by the EA and Ubisoft sources on Windows. See
-[What BoilR ships](#what-boilr-ships) below.
+[What BoilR ships](#what-boilr-ships) below, with the settings and their trade-offs.
 
 ## Test machine
 
@@ -121,22 +121,55 @@ Explorer starts it outside the job.
 
 ## What BoilR ships
 
-Branch `launch-and-wait` (on top of `ea-app-installed-games`):
+Branch `launch-and-wait` (on top of `ea-app-installed-games`), as of round 5 (2026-11-13):
 
 - On Windows, EA games found by their installer data and Ubisoft games found in the registry
-  get a shortcut that runs BoilR itself:
-  `"<BoilR.exe>" --launch-and-wait --game-folder "<install folder>" --launcher "<program>"
-  --link "<link>" [--restart-launcher]`, StartDir = BoilR's folder.
-- BoilR (either binary, before its single-instance lock or any window) starts `<program>` with
-  the quoted link as its own child, waits up to 10 minutes for a program from the install
-  folder, then stays alive until none has run for 5 seconds. Steam tracks BoilR, so the game
-  shows as running and Play doesn't start it twice.
-- EA: `<program>` is `explorer.exe`, so the EA app starts outside Steam's tree (see the EA
-  report for why). No Steam overlay.
-- Ubisoft: `<program>` is `upc.exe`. With the Ubisoft setting `steam_overlay` (off by default),
-  `--restart-launcher` ends Ubisoft Connect before the launch and 10 seconds after the game,
-  so Steam starts it (overlay, Resume) and returns to Play.
+  get a shortcut that runs BoilR itself (`"<BoilR.exe>" --launch-and-wait --game-folder
+  "<install folder>" --launcher "<program>" ...`, StartDir = BoilR's folder). BoilR (either
+  binary, before its single-instance lock or any window) starts `<program>` as its own child,
+  waits up to 10 minutes for a program from the install folder, then stays alive until none
+  has run for 5 seconds. Steam tracks BoilR, so the game shows as running and Play doesn't
+  start it twice.
+- **A launcher BoilR started is closed after the game; one that was open is left alone.**
+  Before launching, BoilR checks whether a program from the launcher's folder runs.
+  - Closed: the launcher starts inside Steam's tree, so the game gets the overlay and Resume.
+    After the game BoilR waits for cloud saves, then closes the launcher, and Steam returns to
+    Play.
+  - Open: the launcher takes the link over, outside Steam's tree. Status right, no overlay,
+    nothing closed.
+- **EA** (`--launcher EALauncher.exe --link origin2://...`): BoilR reads the EA app's
+  `EADesktop.log` to wait until the post-game cloud sync is done (`--sync-log`), then asks
+  the EA app's "EA" window to close (`--close-window`), and only ends its programs if that
+  fails. Play again ~9 s after the game (was ~16 s).
+- **Ubisoft** (`--launcher upc.exe --link uplay://...`): Ubisoft Connect logs no end of its
+  sync and can't be asked to quit (a close request only hides it), so BoilR waits 15 seconds
+  and ends it. Play again ~24 s after the game. Before round 5, a Ubisoft Connect started this
+  way stayed open and Steam showed the game running until it was quit (U2b).
+- **Ubisoft, the game's own program** (setting `start_game_exe`): `--launcher "<game exe>"`
+  without a link, `--start-in`, and `--open-first upc.exe`: when Ubisoft Connect isn't
+  running, BoilR opens it through Explorer (outside Steam) and waits for its window, then
+  starts the game. Ubisoft Connect is never closed; Play again ~7 s after the game. The exe
+  comes from Ubisoft Connect's encrypted catalogue (`src/platforms/uplay/catalogue.rs`, see
+  [Exe paths](ubisoft-connect.md#exe-paths)); games without one, or whose program needs
+  arguments, keep the link.
+- Existing shortcuts get the new behaviour from the installed BoilR as far as their arguments
+  allow (the Ubisoft fix needs nothing more); the EA and `start_game_exe` routes need an
+  import, which rewrites the shortcuts.
 - Linux/Proton shortcuts are unchanged.
+
+### Settings and their trade-offs
+
+| Setting (`settings.toml` key) | Default | What it does | Trade-off |
+|---|---|---|---|
+| *(none)* close a launcher BoilR started | always on | Overlay whenever the launcher was closed; Steam returns to Play after the game | Closes a launcher the user didn't have open. A download started in it during the game stops (EA: asked to close, so the EA app may still object; Ubisoft: ended). A second game started from that launcher during the first one loses it. Not a setting because the alternative (opening the link through Explorer) gives no overlay and nothing else. |
+| EA `steam_overlay` | off | Also close an **open** EA app before the game, so the overlay always reaches it | Stops the EA app's downloads; another EA game running at the time loses its launcher; the EA app restarts with each game (signed in, no prompt, R13/R15). |
+| Ubisoft `steam_overlay` | off | Same for Ubisoft Connect | As EA, plus Ubisoft Connect can only be ended (no clean quit), and a cloud-save upload longer than 15 s is cut off. |
+| Ubisoft `start_game_exe` | off | Steam starts the game's own program; overlay without ever closing Ubisoft Connect, Play ~7 s after the game | Reads Ubisoft Connect's encrypted catalogue cache (format can change without notice; decrypted with the user's own key). Proven on Far Cry 3, Far Cry 4 and AC IV only; newer games may refuse a direct start (Denuvo, Ubisoft+, games that relaunch through Ubisoft Connect). AC IV asked for the password once, Far Cry 4 for admin rights once (prerequisites). |
+
+Kept as constants, not settings (`crates/boilr-core/src/launch_and_wait.rs`): 5 s before a
+game counts as closed, 15 s for cloud saves without a log, 10 s for a logged sync to start
+and 60 s for it to end, 15 s for a launcher to close. Settings would only move the balance
+between a fast Play button and a cut-off upload, which users can't judge.
 
 ## Not yet tried
 

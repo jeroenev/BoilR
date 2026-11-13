@@ -1,5 +1,45 @@
 # Tests that need a person (2026-11-11)
 
+## Round 5: the implemented routes (2026-11-13)
+
+BoilR now closes a launcher it started itself after the game (EA: after the EA app's cloud
+sync, by asking it to close), and can start a Ubisoft game's own program (setting
+`start_game_exe`). Agents confirmed tracking, the overlay being attached, and the Play times
+([EA round 5](ea-app.md#round-5-what-boilr-ships-now-2026-11-13),
+[Ubisoft round 5](ubisoft-connect.md#round-5-what-boilr-ships-now-2026-11-13)). Same
+preparation as below; quit games from their own menu.
+
+**R5-1. TEST EA8 new default** (14108985009255743488), EA app closed.
+- [ ] Home opens the Steam overlay.
+- [ ] "Resume game" returns to the game.
+- [ ] Quit: Steam shows Play within ~10 s, and the EA app is gone from the tray (no dialog).
+
+**R5-2. TEST EA8**, EA app open and signed in.
+- [ ] The game starts. (Home: no overlay is expected here.)
+- [ ] Quit: Play within ~10 s; the EA app stays open.
+
+**R5-3. TEST UB8 FC3 own program** (11972220418510553088), Ubisoft Connect closed. This is
+the case where the overlay flashed and disappeared (4a); now BoilR opens Ubisoft Connect first.
+- [ ] Home opens the Steam overlay, and it stays usable.
+- [ ] "Resume game" returns to the game.
+- [ ] Quit: Play within ~10 s; Ubisoft Connect stays in the tray.
+
+**R5-4. TEST UB3 FC3 helper default** (9439222288433020928), Ubisoft Connect closed.
+- [ ] Home opens the Steam overlay.
+- [ ] Quit: Play within ~30 s (was: never), and Ubisoft Connect is gone from the tray.
+
+**R5-5. Cloud saves**, with a save made in the game before quitting (note the time):
+- [ ] Alice through **TEST EA8** (EA app closed): Play comes back and the EA app closes
+  without a "Saving your progress" dialog. BoilR's log should show `the launcher's cloud
+  sync is done` before `asking the launcher to close`.
+- [ ] Far Cry 3 through **TEST UB3** (Ubisoft Connect closed): afterwards, does Ubisoft
+  Connect show the save as synced the next time it starts (no conflict prompt)?
+
+**R5-6. Optional: the real shortcuts.** Run an import in BoilR (it rewrites the EA and Ubisoft
+shortcuts with the new arguments). For the Ubisoft own-program route, turn on "Start the game's
+own program" in the Ubisoft Connect settings first.
+- [ ] "Alice: Madness Returns" and "Far Cry 3" start and behave like R5-1 and R5-3.
+
 ## Results (2026-11-13)
 
 Filled in by the user with a controller, Steam started normally.

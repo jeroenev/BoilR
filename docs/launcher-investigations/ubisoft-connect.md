@@ -15,14 +15,15 @@ tracks shortcuts and where the logs are.
 | | Status |
 |---|---|
 | Game starts from Steam | Works |
-| Steam overlay, Big Picture "Resume game" | **Works when Steam starts the game's own exe** (U3, U4; no helper, Ubisoft Connect untouched), or when Steam starts Ubisoft Connect (shipped setting `steam_overlay`) |
-| Steam shows the game as running, returns to Play after it | Game's own exe: ~3 s after the game. `steam_overlay`: ~18 s (BoilR ends Ubisoft Connect). Default helper: ~7 s if Ubisoft Connect was open, **never** if it was closed (U2) |
+| Steam overlay, Big Picture "Resume game" | **Works when Steam starts the game's own exe** (U3, U4; setting `start_game_exe` since round 5, U10–U12), or when Steam starts Ubisoft Connect: by default when it was closed (round 5, U9), always with the setting `steam_overlay` |
+| Steam shows the game as running, returns to Play after it | Game's own exe: ~7 s after the game (BoilR's 5 s check included). Link, Ubisoft Connect started by this launch: ~24 s (BoilR waits 15 s, then ends it; U9). Link, Ubisoft Connect open: ~7 s |
 
 **Best approach found: Steam starts the game's exe directly** (round 2, U3/U4). Far Cry 3 and
 4 start Ubisoft Connect themselves when needed, Steam tracks the game, the overlay works,
 Steam returns to Play 3 s after the game, and Ubisoft Connect is never ended (when the game
 starts it, Steam doesn't count it). It needs each game's exe path, which Ubisoft Connect keeps
-in an encrypted cache (see [Exe paths](#exe-paths)).
+in an encrypted cache (see [Exe paths](#exe-paths)). Shipped since round 5 as the opt-in
+setting `start_game_exe`, with Ubisoft Connect opened first through Explorer (see round 5).
 
 ## The game and Ubisoft Connect
 
@@ -118,22 +119,47 @@ Without decryption, `UbisoftGameLauncher.exe`'s command line carries `-upc_exe_p
 ## Risks of `steam_overlay` (why it is off by default)
 
 - Ubisoft Connect is ended, not asked to quit: a running download stops, and a cloud-save
-  upload slower than the 10 s grace could be cut off. U7a/U7c show proper quits are possible.
+  upload slower than the grace period (15 s since round 5) could be cut off. U7a/U7c show
+  proper quits are possible, but need a changed `settings.yaml` or UI automation. Since round
+  5 the same applies, without the setting, to a Ubisoft Connect that BoilR started itself.
 - Before a launch, BoilR ends a running Ubisoft Connect unless a program from *this* game's
   folder runs. Another Ubisoft game running at the time would lose its launcher.
 - If Ubisoft Connect needs a login or a game update first, the helper waits up to 10 minutes
   for the game before it gives up (Steam then shows Play; Ubisoft Connect stays open).
+
+## Round 5: what BoilR ships now (2026-11-13)
+
+Test shortcuts with exactly the arguments BoilR now writes. Game ended by the script; Steam
+started normally; overlay checked by `gameoverlayui64.exe -pid <game>` and the overlay DLL in
+the game, not by Shift+Tab.
+
+| # | What | UC before | Result |
+|---|---|---|---|
+| U9 | TEST UB3: the default helper (`upc.exe` + link), with the installed BoilR | closed | `this launch starts the launcher; it is closed after the game`. Game after 9 s, overlay DLL and overlay UI. After the game, 15 s wait, `ending the launcher (7 programs)`; **Steam back to Play 24 s after the game** (U2b: never). |
+| U10 | TEST UB8: Far Cry 3's own program (`FC3Updater.exe`, from the catalogue), `--open-first upc.exe` | closed | `opening the launcher first`, Ubisoft Connect's window after 3 s, game started 3 s later. Tracked: `FC3Updater.exe` → `farcry3_d3d11.exe`, then `UbisoftGameLauncher.exe` → `FC3Updater.exe` → `farcry3_d3d11.exe` (the game restarts itself through Ubisoft Connect, still inside the tree). Overlay attached. Steam back to Play 7 s after the game; Ubisoft Connect stays open. |
+| U11 | Same | open | Game after 3 s, overlay, Play again 7 s after the game. |
+| U12 | TEST UB9: Far Cry 4's own program | open | Game at once, 64-bit overlay DLL, overlay UI attached. Play again 7 s after the game. No admin prompt. |
+
+`catalogue.rs` decrypts `configurations.vdat` with Windows' own DPAPI and CNG AES-GCM (no new
+crates) and finds on this machine: 46 → `bin\FC3Updater.exe` (start in the install folder),
+420 → `bin\FarCry4.exe`, 273 → `AC4BFSP.exe`. AC Origins is skipped (its program needs
+`/appid:{AppId}`); Watch_Dogs isn't found (its registry entries are missing).
+
+Whether opening Ubisoft Connect first fixes the overlay that flashed and vanished in the user
+test (4a) needs the controller's Home button: see [user tests](user-tests.md).
 
 ## Still open
 
 - Controller checks (user, 2026-11-13, [results](user-tests.md#results-2026-11-13)): the
   direct exe works fully for Far Cry 3, Far Cry 4 and AC IV **when Ubisoft Connect is already
   running**. With Ubisoft Connect closed, Far Cry 3's overlay flashes and disappears (Resume
-  and status fine). Idea: start Ubisoft Connect through `explorer.exe` first, then the exe.
+  and status fine). Round 5 opens Ubisoft Connect through `explorer.exe` first (U10); the
+  Home button on that route is untested.
 - Far Cry 4's admin prompt came only once. Watch_Dogs and AC Origins after "Locate
   installed game" are untested.
 - Games where the direct exe doesn't work: Ubisoft+ titles, games with Denuvo or anti-cheat,
   games whose exe is a separate launcher.
 - A real cloud-save signal: rerun U8 after saving in the game.
-- The default helper with Ubisoft Connect closed (U2b) leaves Steam showing "running". Fix
-  options: open the link through `explorer.exe` (as for EA), or the direct exe.
+- The default helper with Ubisoft Connect closed (U2b) left Steam showing "running". Fixed in
+  round 5: BoilR ends a Ubisoft Connect it started (U9). The 15 s wait before that is a guess
+  without a cloud-save signal (U8); a real save upload is still untested.

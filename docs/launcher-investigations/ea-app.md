@@ -16,16 +16,16 @@ where the logs are.
 
 | | Status |
 |---|---|
-| Game starts from Steam, EA app open or closed | Works (shipped: BoilR wait helper, link through `explorer.exe`) |
-| Steam shows the game as running, returns to Play after it | Works (shipped wait helper) |
-| Steam overlay in the game | **Works when Steam starts the EA app** (EA app closed beforehand: R2, R5); not with the shipped `explorer.exe` route, which keeps the EA app outside Steam's tree |
-| Big Picture "Resume game" | Not with the shipped route; **works** with TEST EA7 (user, 2026-11-13, [results](user-tests.md#results-2026-11-13)) |
+| Game starts from Steam, EA app open or closed | Works (shipped wait helper with `EALauncher.exe`) |
+| Steam shows the game as running, returns to Play after it | Works: ~9 s after the game when BoilR started the EA app (it waits for the cloud sync, then closes the EA app), ~7 s when the EA app was open (round 5) |
+| Steam overlay in the game | **Works when the EA app was closed** (shipped since round 5, R18), or always with the setting `steam_overlay` (R20). Not when an open EA app takes the game over (R19) |
+| Big Picture "Resume game" | Works where the overlay does (user, 2026-11-13, TEST EA7, [results](user-tests.md#results-2026-11-13)) |
 
 The catch of the in-tree route: the EA app then stays in Steam's tree after the game, so Steam
-shows the game as running until the EA app is quit (as Ubisoft Connect, see that report). The
-helper's `--restart-launcher` (end the launcher before and after) handles that: rounds 3 and 4
-(R14, R15: tracking, overlay, Play again ~16 s after the game). BoilR doesn't write such EA
-shortcuts yet; it would be the EA equivalent of Ubisoft's `steam_overlay` setting.
+shows the game as running until the EA app is quit (as Ubisoft Connect, see that report). Since
+round 5 BoilR closes an EA app it started itself, once the EA app's log says its post-game
+cloud sync is done, by asking its window to close. With `steam_overlay` it also closes an open
+EA app before the game ([settings and trade-offs](README.md#settings-and-their-trade-offs)).
 
 ## The game and the EA app
 
@@ -129,11 +129,37 @@ Ubisoft (a download in the EA app is cut off; a second EA game loses its launche
 than Ubisoft: the cloud-sync line could replace the fixed grace, and `WM_CLOSE` could replace
 ending the processes.
 
+## Round 5: what BoilR ships now (2026-11-13)
+
+The implemented routes, through test shortcuts with exactly the arguments BoilR now writes
+(TEST EA8: default; TEST EA9: with `--restart-launcher`). Game ended by the script (as a
+crash would); Steam started normally. The overlay was checked by Steam starting
+`gameoverlayui64.exe -pid <game>` and `gameoverlayrenderer.dll` in the game, not by Shift+Tab.
+
+| # | What | EA app before | Result |
+|---|---|---|---|
+| R18 | TEST EA8 (default) | closed | Log: `this launch starts the launcher`. Game after 5 s, tracked, overlay DLL and overlay UI attached. After the game: `the launcher's cloud sync is done` (already logged during the 5 s exit check), `asking the launcher to close`, `the launcher closed after 2.0s`. **Steam back to Play 9.1 s after the game** (R14: 16 s). |
+| R19 | TEST EA8 (default) | open (via Explorer) | `the launcher is open; it takes the game over and stays open`. Game after 3 s, not in Steam's tree, no overlay. Steam back to Play 7.1 s after the game; EA app still open. |
+| R20 | TEST EA9 (`--restart-launcher`) | open | Open EA app asked to close: gone after 2 s. Then as R18: overlay, Play again 9.1 s after the game, EA app closed. |
+| R21 | Close request to the "EA" window while a game runs | open, game running | The EA app shows **"Close your game, first"** and stays open. BoilR only asks after the game. |
+
+The EA app's top-level windows (Qt): two titled "EA" (`Qt5152QWindowOwnDCIcon`), plus tray,
+power and IME windows. A close request to the "EA" windows quits it in 1–2 s once no game
+and no sync runs. The log has `Cloud Sync entry point post game termination` when the sync
+after a game starts and `ProcessCoordinator::handleTerminalCloudSyncStatus` when it ends
+("Post game cloud sync completed successfully"); BoilR waits up to 10 s for the first and up
+to 60 s for the second, and reads only what the log got since the game started.
+
+The minute-long Stop (TEST EA7, user tests): a close request makes the EA app log `Starting
+shutdown timeout, duration[60s]`. Steam's Stop probably asks the same way while the game
+runs, and the EA app waits out that timeout. Not confirmed.
+
 ## Still open
 
 - Controller checks on TEST EA7 and TEST EA6 passed (user, 2026-11-13: Home overlay, Resume,
   Play again). Still odd: Steam's Stop on TEST EA7 hangs about a minute before the game
-  closes, and one F12 screenshot failed with the EA app open beforehand.
+  closes (see round 5 for a likely cause), and one F12 screenshot failed with the EA app open
+  beforehand. TEST EA8 still needs the controller checks (see [user tests](user-tests.md)).
 - How long a real cloud upload takes (play, let the game save, quit; R16).
 - Only one EA game (Alice) was tried. Newer EA games (EA anticheat, Denuvo, their own
   launchers such as the Sims 4 or Battlefield ones) may hand over to other programs or run
