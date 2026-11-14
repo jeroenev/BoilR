@@ -23,8 +23,9 @@ pub struct UbisoftSettings {
     /// shows Play again seconds after the game. Off by default: it reads Ubisoft Connect's
     /// encrypted catalogue cache, whose format can change without notice, and newer games
     /// may refuse to start this way (tried with Far Cry 3, Far Cry 4 and Assassin's Creed
-    /// IV). Games whose program isn't found, or that need arguments, keep the link. Takes
-    /// precedence over [`Self::steam_overlay`] for the games it finds.
+    /// IV). Games whose program isn't found, needs arguments, or is the game's updater (Far
+    /// Cry 3), keep the link. Takes precedence over [`Self::steam_overlay`] for the games it
+    /// finds.
     #[serde(default)]
     pub start_game_exe: bool,
 }

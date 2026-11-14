@@ -37,6 +37,9 @@ struct Executable {
     arguments: Option<String>,
     /// `arguments_register:`, the registry entry holding the arguments.
     arguments_register: Option<String>,
+    /// `evil_updater: path: relative:`, the updater Ubisoft Connect runs before the game, and
+    /// the registry entry holding the folder it runs in.
+    updater: Option<(String, Option<String>)>,
 }
 
 /// One field of a protobuf message: its number and value (other wire types are skipped).
@@ -216,11 +219,17 @@ fn first_executable(yaml: &str) -> Option<Executable> {
     };
     let working_directory = block(&item, "working_directory")
         .and_then(|lines| Some((value(&lines, "register")?, value(&lines, "append"))));
+    let updater = block(&item, "evil_updater").and_then(|lines| {
+        let path = value(&block(&lines, "path")?, "relative")?;
+        let folder = block(&lines, "working_directory").and_then(|lines| value(&lines, "register"));
+        Some((path, folder))
+    });
     Some(Executable {
         path,
         working_directory,
         arguments: value(&item, "arguments"),
         arguments_register: value(&item, "arguments_register"),
+        updater,
     })
 }
 
@@ -264,6 +273,27 @@ impl Executable {
             Source::Relative(path) => windows_join(&working_directory, path),
             Source::Register(register) => windows_join(&working_directory, &read(register)?),
         };
+        // The program is the game's updater (Far Cry 3: `ExecutableName` names
+        // `FC3Updater.exe`, which starts the game, which then restarts itself through Ubisoft
+        // Connect). Steam's overlay is unreliable that way (user tests R8-1, R8-2), so such a
+        // game keeps its link.
+        if let Some((updater, folder)) = &self.updater {
+            let folder = match folder {
+                Some(register) => windows_path(&read(register)?),
+                None => working_directory.clone(),
+            };
+            let updater = windows_join(&folder, updater);
+            let same = |path: &std::path::Path| {
+                path.to_string_lossy()
+                    .to_lowercase()
+                    .replace('/', "\\")
+                    .trim_end_matches('\\')
+                    .to_string()
+            };
+            if same(&updater) == same(&exe) {
+                return None;
+            }
+        }
         Some(GameProgram {
             exe,
             working_directory,
@@ -571,10 +601,19 @@ root:
 
     #[test]
     fn finds_the_first_online_program() {
+        // Far Cry 3's program is its updater: skipped (see `locate`).
+        assert_eq!(program(FAR_CRY_3), None);
+        let not_the_updater = |entry: &str| {
+            if entry.ends_with("ExecutableName") {
+                Some("bin/farcry3.exe".to_string())
+            } else {
+                registry(entry)
+            }
+        };
         assert_eq!(
-            program(FAR_CRY_3),
+            first_executable(FAR_CRY_3).and_then(|exe| exe.locate(not_the_updater)),
             Some(GameProgram {
-                exe: windows_path("D:/UplayLibrary/Far Cry 3/bin/FC3Updater.exe"),
+                exe: windows_path("D:/UplayLibrary/Far Cry 3/bin/farcry3.exe"),
                 working_directory: windows_path("D:/UplayLibrary/Far Cry 3"),
             })
         );
