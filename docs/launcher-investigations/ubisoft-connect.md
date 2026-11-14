@@ -228,12 +228,17 @@ instead of 5 s, and close a Ubisoft Connect BoilR started 5 s after the game ins
 
 ## Still open
 
-- **Far Cry 3 in-game:** the Steam overlay works in the main menu and breaks once a level is
-  loaded (once not shown, once the game crashed; user, TEST UB11, which starts Ubisoft
-  Connect inside Steam's tree). Earlier Far Cry 3 checks were all made in the main menu, so
-  every route may have it. Far Cry 3 also loads Ubisoft's own overlay (`overlay.dll`) next to
-  Steam's. Next test: turn off Ubisoft Connect's in-game overlay (Settings, General) and try
-  in a level again; and check Far Cry 4 and AC IV in a level.
+- **Far Cry 3's own program:** the Steam overlay is unreliable on this route (user, R8-1: in
+  the main menu and in a level), also with Ubisoft's in-game overlay turned off (R8-2: no
+  crash then). Far Cry 4 and AC IV work fully on it (R8-3), and Far Cry 3 works through the
+  default shortcut (R8-4, overlay in a level). The catalogue's program for Far Cry 3 is
+  `FC3Updater.exe` (registry `ExecutableName`), which starts the game, which restarts itself
+  through Ubisoft Connect (U10). Test 4b started `bin\farcry3.exe` with Ubisoft Connect open,
+  and the overlay worked. Next: `farcry3.exe` through the helper with `--open-first` (TEST
+  UB15, user test R9-1). If that works, the catalogue could prefer a program that isn't an
+  updater, but that would be a Far Cry 3 special case. Otherwise `start_game_exe` stays
+  experimental with Far Cry 3 as a known exception.
+- The earlier Far Cry 3 in-game crash (R5-5, TEST UB11) didn't come back in R8-4.
 
 - Controller checks (user, 2026-11-13, [results](user-tests.md#results-2026-11-13)): the
   direct exe works fully for Far Cry 3, Far Cry 4 and AC IV **when Ubisoft Connect is already

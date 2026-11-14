@@ -1,5 +1,30 @@
 # Tests that need a person (2026-11-11)
 
+## Round 9: Far Cry 3 through farcry3.exe (2026-11-14)
+
+**R9-1. TEST UB15 FC3 farcry3.exe ready** (10348851028346011648): BoilR's helper starts
+`binarcry3.exe` instead of the catalogue's `FC3Updater.exe`, Ubisoft Connect opened first.
+An agent run (Ubisoft Connect closed): one `farcry3_d3d11.exe` instead of two, tracked, Steam's
+overlay attached, no sign-in error, Play again 7 s after the game. Ubisoft Connect closed first;
+Ubisoft's in-game overlay back on.
+- [ ] Home opens the Steam overlay in the main menu, and it stays usable.
+- [ ] Same in a loaded level, a few times.
+- [ ] Quit: Play again within ~10 s; Ubisoft Connect stays in the tray.
+
+## Round 8 results (2026-11-14)
+
+| Test | Result |
+|---|---|
+| R8-1 TEST UB12, Far Cry 3's own program | No sign-in error any more, Play again fine. **Overlay still unreliable**, in the main menu and in a level. |
+| R8-2 Same, Ubisoft's in-game overlay off | Overlay still broken, **no crash**. So Ubisoft's overlay isn't what breaks Steam's here (it may have caused the earlier crash). |
+| R8-3 TEST UB13 (Far Cry 4), TEST UB14 (AC IV), own program | **All yes**, overlay in a level included. AC IV asked for admin rights and the Ubisoft password again. |
+| R8-4 TEST UB11, Ubisoft default with the 5 s close | **All yes:** overlay in a level, Play again within ~20 s with Ubisoft Connect gone, no save conflict after a save. |
+
+So the own-program route works for Far Cry 4 and AC IV; Far Cry 3 is the exception. Its
+catalogue program is `FC3Updater.exe`, which starts the game, which then restarts itself
+through Ubisoft Connect (two `farcry3_d3d11.exe` in a row, U10). Test 4b (`farcry3.exe`,
+Ubisoft Connect open) had a working overlay. Next: R9-1.
+
 ## Round 8: shorter waits, and the overlay inside a level (2026-11-13)
 
 BoilR asks a Ubisoft Connect it started to quit 5 s after the game (was 15 s). Starting a
