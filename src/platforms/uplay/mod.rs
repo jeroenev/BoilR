@@ -1,3 +1,4 @@
+mod catalogue;
 mod game;
 mod platform;
 mod settings;
