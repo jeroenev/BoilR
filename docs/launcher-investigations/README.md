@@ -154,8 +154,9 @@ Branch `launch-and-wait` (on top of `ea-app-installed-games`), as of round 5 (20
   signed in (`--open-first-log`, `--open-first-ready`) plus 5 s, then starts the game
   (round 7: a game started earlier makes Ubisoft Connect ask to sign in again). Ubisoft Connect is never closed; Play again ~7 s after the game. The exe
   comes from Ubisoft Connect's encrypted catalogue (`src/platforms/uplay/catalogue.rs`, see
-  [Exe paths](ubisoft-connect.md#exe-paths)); games without one, or whose program needs
-  arguments, keep the link.
+  [Exe paths](ubisoft-connect.md#exe-paths)); games without one, whose program needs
+  arguments, or whose program is the game's updater (Far Cry 3's `FC3Updater.exe`, round 9),
+  keep the link.
 - Existing shortcuts get the new behaviour from the installed BoilR as far as their arguments
   allow (the Ubisoft fix needs nothing more); the EA and `start_game_exe` routes need an
   import, which rewrites the shortcuts.

@@ -2,6 +2,10 @@
 
 ## Round 9: Far Cry 3 through farcry3.exe (2026-11-14)
 
+**Result (user): yes, yes, yes.** The overlay works in the main menu and in a level, and Play
+comes back with Ubisoft Connect left open. BoilR now leaves a game on its link when the
+catalogue's program is the game's updater, as Far Cry 3's is.
+
 **R9-1. TEST UB15 FC3 farcry3.exe ready** (10348851028346011648): BoilR's helper starts
 `binarcry3.exe` instead of the catalogue's `FC3Updater.exe`, Ubisoft Connect opened first.
 An agent run (Ubisoft Connect closed): one `farcry3_d3d11.exe` instead of two, tracked, Steam's

@@ -228,16 +228,16 @@ instead of 5 s, and close a Ubisoft Connect BoilR started 5 s after the game ins
 
 ## Still open
 
-- **Far Cry 3's own program:** the Steam overlay is unreliable on this route (user, R8-1: in
-  the main menu and in a level), also with Ubisoft's in-game overlay turned off (R8-2: no
-  crash then). Far Cry 4 and AC IV work fully on it (R8-3), and Far Cry 3 works through the
-  default shortcut (R8-4, overlay in a level). The catalogue's program for Far Cry 3 is
-  `FC3Updater.exe` (registry `ExecutableName`), which starts the game, which restarts itself
-  through Ubisoft Connect (U10). Test 4b started `bin\farcry3.exe` with Ubisoft Connect open,
-  and the overlay worked. Next: `farcry3.exe` through the helper with `--open-first` (TEST
-  UB15, user test R9-1). If that works, the catalogue could prefer a program that isn't an
-  updater, but that would be a Far Cry 3 special case. Otherwise `start_game_exe` stays
-  experimental with Far Cry 3 as a known exception.
+- ~~**Far Cry 3's own program**~~: solved in round 9. The catalogue's program for Far Cry 3
+  is `FC3Updater.exe` (registry `ExecutableName`), which is also the entry's `evil_updater`.
+  It starts the game, which then restarts itself through Ubisoft Connect (two
+  `farcry3_d3d11.exe`, U10), and Steam's overlay was unreliable that way (user, R8-1; also
+  with Ubisoft's in-game overlay off, R8-2). Through `bin\farcry3.exe` (TEST UB15) the game
+  starts once and the overlay worked in the main menu and in a level (user, R9-1). The
+  catalogue doesn't name `farcry3.exe`, so BoilR can't find it; instead, a game whose program
+  is its own `evil_updater` keeps the link (`catalogue.rs`), and Far Cry 3 uses the default
+  shortcut, which works fully (R8-4). A per-game override (46 → `bin\farcry3.exe`) would give
+  Far Cry 3 the own-program route too; not done, as it is game-specific knowledge in BoilR.
 - The earlier Far Cry 3 in-game crash (R5-5, TEST UB11) didn't come back in R8-4.
 
 - Controller checks (user, 2026-11-13, [results](user-tests.md#results-2026-11-13)): the
