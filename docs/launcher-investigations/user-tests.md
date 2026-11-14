@@ -1,5 +1,13 @@
 # Tests that need a person (2026-11-11)
 
+## Real shortcuts (2026-11-14)
+
+The user imported with BoilR (Ubisoft `start_game_exe` off): **"Far Cry 3" and "Alice: Madness
+Returns" work as tested** (R5-6). **AC IV still asks for admin rights and the Ubisoft password
+through the default shortcut**, as it did through its own program (R8-3), so that is AC IV's
+own behaviour (Ubisoft Connect retrying its prerequisite installers, and its password check;
+U4 AC4), not a cost of either route.
+
 ## Round 9: Far Cry 3 through farcry3.exe (2026-11-14)
 
 **Result (user): yes, yes, yes.** The overlay works in the main menu and in a level, and Play

@@ -228,6 +228,10 @@ instead of 5 s, and close a Ubisoft Connect BoilR started 5 s after the game ins
 
 ## Still open
 
+- AC IV asks for admin rights and the Ubisoft password on every launch tested, through the
+  default shortcut too (user, 2026-11-14). Whether it does the same when started from Ubisoft
+  Connect itself is unchecked; if so, nothing in BoilR can avoid it.
+
 - ~~**Far Cry 3's own program**~~: solved in round 9. The catalogue's program for Far Cry 3
   is `FC3Updater.exe` (registry `ExecutableName`), which is also the entry's `evil_updater`.
   It starts the game, which then restarts itself through Ubisoft Connect (two
