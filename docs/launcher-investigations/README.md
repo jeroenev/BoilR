@@ -7,6 +7,7 @@ per-launcher reports hold every scenario that was tried, with what worked and wh
 - [EA app](ea-app.md): Alice: Madness Returns.
 - [Ubisoft Connect](ubisoft-connect.md): Far Cry 3 (plus Far Cry 4 and AC IV in round 2).
 - [Tests that need a person](user-tests.md): controller, UAC, passwords, save games.
+- [Diagnosis](DIAGNOSIS.md): every scenario tested and its result, and every issue found, in one file.
 
 What BoilR does as a result: `boilr_core::launch_and_wait` (the `--launch-and-wait` mode of
 both BoilR binaries), used by the EA and Ubisoft sources on Windows. See
